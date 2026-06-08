@@ -1,6 +1,7 @@
 import os
 import io
 import csv
+import glob
 import json
 import re
 import threading
@@ -40,32 +41,44 @@ def filter_rows(rows):
     return filtered
 
 
-# Matches: IP/prefix followed by one or more dashes or spaces, then the name.
-# Supports both "10.0.1.0/24 My Network" and "10.0.1.0/24-My-Network".
-_SUBNET_LINE_RE = re.compile(r'^(\d+\.\d+\.\d+\.\d+/\d+)[-\s]+(.+)$')
+# Subnet name maps are staged alongside this script as one or more CSV files
+# whose names start with "all_networks" (e.g. all_networks_10_0_0_0.csv).
+# Each file has a "CIDR,NAME" header row.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SUBNET_FILE_PREFIX = "all_networks"
 
 
-def parse_subnet_map(file_stream):
+def load_staged_subnet_map():
     """
-    Parse a subnet name map file. Each non-blank line is:
-        CIDR<sep>Name   where <sep> is a dash or whitespace
-    e.g.  10.0.161.64/28 DM9 Service Console
-          10.0.163.48/28-DM9-Commvault-Backups
-    Returns list of (ip_network, name_str) sorted most-specific first.
+    Build the subnet name map from every CSV staged in the app directory whose
+    filename starts with "all_networks". Each file is a CSV with CIDR and NAME
+    columns, e.g.:
+        CIDR,NAME
+        10.14.216.0/24,TNF-Hillside-VLAN-2
+    Returns list of (ip_network, name_str) sorted most-specific first so the
+    best (longest-prefix) match wins.
     """
-    content = file_stream.read().decode("utf-8-sig")
     subnets = []
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = _SUBNET_LINE_RE.match(line)
-        if not m:
-            continue
+    pattern = os.path.join(APP_DIR, SUBNET_FILE_PREFIX + "*.csv")
+    for path in sorted(glob.glob(pattern)):
         try:
-            net = ipaddress.ip_network(m.group(1), strict=False)
-            subnets.append((net, m.group(2).strip()))
-        except ValueError:
+            with open(path, encoding="utf-8-sig", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    clean = {k.strip().lower(): (v or "").strip()
+                             for k, v in row.items() if k}
+                    cidr = clean.get("cidr", "")
+                    name = clean.get("name", "")
+                    # A row needs both a CIDR and a name; a nameless entry would
+                    # otherwise produce an empty-named Check Point object later.
+                    if not cidr or not name:
+                        continue
+                    try:
+                        net = ipaddress.ip_network(cidr, strict=False)
+                    except ValueError:
+                        continue
+                    subnets.append((net, name))
+        except OSError:
             continue
     # Most-specific prefix first so best-match wins
     subnets.sort(key=lambda x: x[0].prefixlen, reverse=True)
@@ -906,8 +919,7 @@ ANALYZER_HTML = r"""
     border-color: var(--accent);
     background: rgba(0,212,255,0.04);
   }
-  #dropzone input[type=file],
-  #subnet-dropzone input[type=file] {
+  #dropzone input[type=file] {
     position: absolute;
     inset: 0;
     opacity: 0;
@@ -936,35 +948,6 @@ ANALYZER_HTML = r"""
     font-size: 0.78rem;
     color: var(--success);
     margin-top: 16px;
-    min-height: 1.2em;
-  }
-
-  #subnet-dropzone {
-    border: 1px dashed var(--border);
-    padding: 28px 24px;
-    text-align: center;
-    cursor: pointer;
-    transition: all 0.2s;
-    position: relative;
-    background: rgba(0,212,255,0.01);
-  }
-  #subnet-dropzone:hover, #subnet-dropzone.drag-over {
-    border-color: var(--accent);
-    background: rgba(0,212,255,0.04);
-  }
-  #subnet-dropzone input[type=file] {
-    position: absolute;
-    inset: 0;
-    opacity: 0;
-    cursor: pointer;
-    width: 100%;
-    height: 100%;
-  }
-  #subnet-name {
-    font-family: var(--mono);
-    font-size: 0.78rem;
-    color: var(--accent);
-    margin-top: 10px;
     min-height: 1.2em;
   }
 
@@ -1200,17 +1183,6 @@ ANALYZER_HTML = r"""
     </div>
     <div id="file-name"></div>
 
-    <div style="margin-top:20px;">
-      <div class="card-label" style="margin-bottom:12px;">Subnet Name Map &mdash; Optional</div>
-      <div id="subnet-dropzone">
-        <input type="file" id="subnet-input" accept=".txt">
-        <div class="drop-icon" style="font-size:1.6rem;margin-bottom:8px;">🗂️</div>
-        <div class="drop-title" style="font-size:0.85rem;">Drop subnet map .txt file here</div>
-        <div class="drop-sub">or click to browse &nbsp;·&nbsp; format: <code>10.0.1.0/24 My Subnet Name</code></div>
-      </div>
-      <div id="subnet-name"></div>
-    </div>
-
     <div class="actions">
       <button class="btn btn-primary" id="analyze-btn" disabled>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1272,9 +1244,6 @@ ANALYZER_HTML = r"""
   const fileInput     = document.getElementById('file-input');
   const dropzone      = document.getElementById('dropzone');
   const fileNameEl    = document.getElementById('file-name');
-  const subnetInput   = document.getElementById('subnet-input');
-  const subnetDrop    = document.getElementById('subnet-dropzone');
-  const subnetNameEl  = document.getElementById('subnet-name');
   const analyzeBtn    = document.getElementById('analyze-btn');
   const statusBar     = document.getElementById('status-bar');
   const statusMsg     = document.getElementById('status-msg');
@@ -1304,26 +1273,9 @@ ANALYZER_HTML = r"""
     }
   }
 
-  // ── Subnet Map Drag & Drop ──
-  subnetDrop.addEventListener('dragover', e => { e.preventDefault(); subnetDrop.classList.add('drag-over'); });
-  subnetDrop.addEventListener('dragleave', () => subnetDrop.classList.remove('drag-over'));
-  subnetDrop.addEventListener('drop', e => {
-    e.preventDefault();
-    subnetDrop.classList.remove('drag-over');
-    if (e.dataTransfer.files.length) { subnetInput.files = e.dataTransfer.files; updateSubnet(); }
-  });
-  subnetInput.addEventListener('change', updateSubnet);
-
-  function updateSubnet() {
-    if (subnetInput.files.length) {
-      subnetNameEl.textContent = '✓ ' + subnetInput.files[0].name + ' loaded';
-    }
-  }
-
   function buildFormData() {
     const fd = new FormData();
     fd.append('file', fileInput.files[0]);
-    if (subnetInput.files.length) fd.append('subnet_map', subnetInput.files[0]);
     return fd;
   }
 
@@ -1331,10 +1283,7 @@ ANALYZER_HTML = r"""
   analyzeBtn.addEventListener('click', async () => {
     if (!fileInput.files.length) return;
 
-    const hasMap = subnetInput.files.length > 0;
-    setStatus('active', hasMap
-      ? 'Uploading and analyzing with subnet name map…'
-      : 'Uploading and analyzing traffic data…');
+    setStatus('active', 'Uploading and analyzing traffic data…');
     analyzeBtn.disabled = true;
     resultsEl.classList.remove('visible');
 
@@ -2178,11 +2127,8 @@ def scanner_page():
 
 
 def _load_subnet_map():
-    """Read optional subnet_map file from the current request, or return []."""
-    f = request.files.get("subnet_map")
-    if f and f.filename:
-        return parse_subnet_map(f)
-    return []
+    """Load the subnet name map from the all_networks*.csv files staged in the app dir."""
+    return load_staged_subnet_map()
 
 
 @app.route("/analyze", methods=["POST"])
