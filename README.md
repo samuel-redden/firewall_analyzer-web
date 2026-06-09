@@ -1,7 +1,15 @@
 # Firewall Rule Analyzer
 
-Analyzes firewall hit logs (CSV) to generate least-permissive replacement rules,
-automatically collapsing IPs into subnets where >50% of the /24 is present.
+A local web toolbox for firewall engineers. It runs on your machine, opens a
+browser tab automatically, and provides two tools from a single landing page:
+
+- **Rule Analyzer** — analyzes firewall hit logs (CSV) to generate
+  least-permissive replacement rules, and can emit a Check Point `mgmt_cli`
+  object-creation script.
+- **Policy Scanner** — audits a SecureTrack-style policy export against eight
+  severity-rated checks, scores the policy out of 1000 on a speedometer
+  dashboard, recommends uni-directional splits for bi-directional rules, and
+  exports findings as CSVs or polished HTML reports.
 
 ---
 
@@ -9,9 +17,11 @@ automatically collapsing IPs into subnets where >50% of the /24 is present.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Flask application — the entire tool |
+| `app.py` | Flask application — the entire tool (engines + embedded UI) |
 | `firewall_analyzer.spec` | PyInstaller build spec |
-| `sample_traffic.csv` | Example input for testing |
+| `sample_traffic.csv` | Example input for the Rule Analyzer |
+| `sample_policy.csv` | Example input for the Policy Scanner |
+| `all_networks*.csv` (optional) | Subnet name map files staged next to `app.py` |
 | `README.md` | This file |
 
 ---
@@ -33,7 +43,7 @@ A browser tab will open automatically at http://127.0.0.1:5000
 
 ### Prerequisites
 
-1. Install Python 3.8+ from https://python.org  
+1. Install Python 3.8+ from https://python.org
    ✅ Check "Add Python to PATH" during install
 
 2. Open Command Prompt and install dependencies:
@@ -62,6 +72,11 @@ No Python installation is required on the target machine.
 
 ---
 
+# Tool 1: Rule Analyzer
+
+Takes a traffic-hit CSV and emits the least-permissive rule set that covers the
+observed traffic.
+
 ## CSV Input Format
 
 | Column | Description |
@@ -73,27 +88,83 @@ No Python installation is required on the target machine.
 | `service` | Port number |
 | `count` | Number of hits for this flow |
 
----
-
 ## Rule Design Logic
 
 - **Minimum hits:** Flows with `count < 2` are excluded (noise filtering)
-- **Subnet summarization:** If >50% of IPs in a /24 subnet appear in src or dst, the rule uses the subnet (e.g., `10.0.68.0/24`) instead of individual IPs
-- **Least permissive:** Rules are scoped to exact destination IPs and specific ports/protocols
-- **Output format:** `Source, Destination, Service` (e.g., `10.0.68.0/24, 10.27.221.240, tcp-2443`)
+- **Subnet summarization:** If ≥50% of IPs in a /24 subnet appear (or ≥10
+  distinct IPs), the rule uses the subnet (e.g., `10.0.68.0/24`) instead of
+  individual IPs
+- **Port compression:** Consecutive ports collapse into ranges
+  (`tcp-80-82`); rules needing 6+ service objects are flagged for an
+  object group
+- **Least permissive:** Rules are scoped to exact destination IPs and specific
+  ports/protocols
+- **Output format:** `Source, Destination, Service`
+  (e.g., `10.0.68.0/24, 10.27.221.240, tcp-2443`)
+
+## Outputs
+
+- **Rules CSV** — the generated replacement rules
+- **Check Point script** — a `mgmt_cli` bash script that creates the
+  host/network/service/service-group objects for the rules (it deliberately
+  does **not** create the access rules themselves)
 
 ---
 
-## Output CSV Example
+# Tool 2: Policy Scanner
 
-```
-Source,Destination,Service
-10.0.68.0/24,10.27.221.240,tcp-2443
-192.168.10.5,10.27.221.100,tcp-443
-192.168.10.8,10.27.221.100,tcp-443
-192.168.20.1,10.27.221.100,tcp-443
-172.16.5.10,10.27.221.100,udp-53
-172.16.5.20,10.27.221.100,udp-53
-10.1.1.5,10.50.0.20,tcp-8080
-10.1.1.6,10.50.0.20,tcp-8080
-```
+Reads a SecureTrack-style policy export CSV (the first 3 lines are report
+metadata and are skipped; line 4 is the header) and audits every rule.
+
+## Audit Checks and Scoring
+
+The policy starts at **1000 points** and every individual finding deducts its
+severity's points (a rule can be flagged by several checks at once; the score
+floors at 0).
+
+| Check | Severity | Deduction |
+|-------|----------|-----------|
+| `Any` as source, destination, or service (ALLOW rules only) | Critical | −6 |
+| Overly permissive ALLOW rule (network /16 or wider, broad service such as `ALL_*` or a >1000-port range, or >10 objects in one field) | High | −4 |
+| Bi-directional (Source == Destination) | Medium | −2 |
+| Missing logging (`Logged` column not true) | Medium | −2 |
+| Missing comment | Low | −1 |
+| Unused (never hit, or last hit > 180 days ago) | Low | −1 |
+| Disabled | Low | −1 |
+| Shadowed (`Shadowing Status` is shadowed) | Low | −1 |
+
+## Score Dashboard
+
+- **Speedometer gauge** with the score, needle, and color-banded track:
+  above **950** green (Excellent), above **800** yellow (Good),
+  **600–800** orange (At Risk), below **600** red (Critical)
+- **Device name(s)** from the export, shown in bold and colored by the
+  overall score band
+- **Category cards** — click a category to view its flagged rules, each with
+  an explanation of exactly why it was flagged
+
+## Exports
+
+- **Per-category CSV** or **all-findings CSV** worklists
+- **Executive Report** — a self-contained, print-ready HTML summary for
+  leadership: score, findings at a glance, plain-language risk narrative, and
+  recommended next steps
+- **Engineer Cleanup Plan** — a self-contained HTML runbook: prioritized
+  remediation phases with step-by-step guidance and the affected rules per
+  phase
+
+## Bi-Directional Split Recommendations
+
+Select flagged bi-directional rules and click **Recommendations** to generate
+least-permissive uni-directional replacements (objects are clustered by shared
+/16 or common name prefix), then download them as CSV.
+
+---
+
+## Subnet Name Map (optional)
+
+Stage one or more `all_networks*.csv` files (header: `CIDR,NAME`) next to
+`app.py` (or the `.exe`). The Rule Analyzer uses the names for display labels
+and Check Point object names; the longest-prefix match wins, and named subnets
+take priority over automatic /24 aggregation. The files are read from disk on
+each request — no upload needed.
