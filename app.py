@@ -48,6 +48,72 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SUBNET_FILE_PREFIX = "all_networks"
 
 
+class SubnetMap:
+    """
+    Holds the staged subnet name map. Behaves like the old list of
+    (ip_network, name) tuples — it is iterable (most-specific first), supports
+    len() and truthiness — so existing call sites keep working. On top of that
+    it provides match(), a longest-prefix lookup that is ~O(distinct prefix
+    lengths) instead of a linear scan over every network.
+
+    The lookup groups networks into per-(version, prefix-length) dicts keyed by
+    the network address as an int. To match an IP we walk the distinct prefix
+    lengths from longest to shortest, mask the IP to each length, and do a dict
+    lookup — the first hit is the most-specific match.
+    """
+
+    def __init__(self, entries):
+        # entries: list of (ip_network, name), already sorted most-specific first.
+        self.entries = entries
+        # version -> list of prefix lengths present, longest first
+        self._plens = {4: [], 6: []}
+        # version -> prefix_len -> {network_int: (net, name)}
+        self._buckets = {4: {}, 6: {}}
+        # version -> prefix_len -> mask int
+        self._masks = {4: {}, 6: {}}
+        bits = {4: 32, 6: 128}
+        for net, name in entries:
+            v = net.version
+            plen = net.prefixlen
+            bucket = self._buckets[v].get(plen)
+            if bucket is None:
+                bucket = self._buckets[v][plen] = {}
+                self._masks[v][plen] = ((1 << plen) - 1) << (bits[v] - plen)
+            # First entry wins for an exact-duplicate CIDR, matching the old
+            # linear scan which returned the first match in sorted order.
+            bucket.setdefault(int(net.network_address), (net, name))
+        for v in (4, 6):
+            self._plens[v] = sorted(self._buckets[v].keys(), reverse=True)
+
+    def match(self, ip_obj):
+        """Return (network, name) for the most-specific named subnet containing ip_obj, or None."""
+        v = ip_obj.version
+        ip_int = int(ip_obj)
+        buckets = self._buckets[v]
+        masks = self._masks[v]
+        for plen in self._plens[v]:
+            hit = buckets[plen].get(ip_int & masks[plen])
+            if hit is not None:
+                return hit
+        return None
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __bool__(self):
+        return bool(self.entries)
+
+
+def clean_subnet_name(name):
+    """Collapse runs of 2+ hyphens to a single '-' (e.g. 'NCZ---Maria-Parham'
+    -> 'NCZ-Maria-Parham'). The all_networks exports use '---' as a separator;
+    we normalize it for both the web GUI display and the file exports."""
+    return re.sub(r"-{2,}", "-", name)
+
+
 def load_staged_subnet_map():
     """
     Build the subnet name map from every CSV staged in the app directory whose
@@ -55,8 +121,8 @@ def load_staged_subnet_map():
     columns, e.g.:
         CIDR,NAME
         10.14.216.0/24,TNF-Hillside-VLAN-2
-    Returns list of (ip_network, name_str) sorted most-specific first so the
-    best (longest-prefix) match wins.
+    Returns a SubnetMap of (ip_network, name_str) entries sorted most-specific
+    first so the best (longest-prefix) match wins.
     """
     subnets = []
     pattern = os.path.join(APP_DIR, SUBNET_FILE_PREFIX + "*.csv")
@@ -73,6 +139,7 @@ def load_staged_subnet_map():
                     # otherwise produce an empty-named Check Point object later.
                     if not cidr or not name:
                         continue
+                    name = clean_subnet_name(name)
                     try:
                         net = ipaddress.ip_network(cidr, strict=False)
                     except ValueError:
@@ -82,11 +149,15 @@ def load_staged_subnet_map():
             continue
     # Most-specific prefix first so best-match wins
     subnets.sort(key=lambda x: x[0].prefixlen, reverse=True)
-    return subnets
+    return SubnetMap(subnets)
 
 
 def match_named_subnet(ip_obj, subnet_map):
     """Return (network, name) for the most-specific named subnet containing ip_obj, or None."""
+    matcher = getattr(subnet_map, "match", None)
+    if matcher is not None:
+        return matcher(ip_obj)
+    # Fallback for a plain list of (net, name) tuples.
     for net, name in subnet_map:
         if ip_obj in net:
             return net, name
@@ -2126,9 +2197,38 @@ def scanner_page():
     return render_template_string(SCANNER_HTML)
 
 
+_subnet_cache_lock = threading.Lock()
+_subnet_cache = {"sig": None, "map": None}
+
+
+def _staged_subnet_signature():
+    """A cheap fingerprint of the staged all_networks*.csv files (path, mtime, size).
+    Changes whenever a file is added, removed, or edited, so the cache stays fresh."""
+    pattern = os.path.join(APP_DIR, SUBNET_FILE_PREFIX + "*.csv")
+    sig = []
+    for path in sorted(glob.glob(pattern)):
+        try:
+            st = os.stat(path)
+            sig.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
 def _load_subnet_map():
-    """Load the subnet name map from the all_networks*.csv files staged in the app dir."""
-    return load_staged_subnet_map()
+    """Load the subnet name map from the all_networks*.csv files staged in the app dir.
+
+    Parsing ~140k rows on every request is the bulk of the per-request cost, so the
+    built SubnetMap is cached in memory and only rebuilt when the staged files change.
+    """
+    sig = _staged_subnet_signature()
+    with _subnet_cache_lock:
+        if _subnet_cache["sig"] == sig and _subnet_cache["map"] is not None:
+            return _subnet_cache["map"]
+        subnet_map = load_staged_subnet_map()
+        _subnet_cache["sig"] = sig
+        _subnet_cache["map"] = subnet_map
+        return subnet_map
 
 
 @app.route("/analyze", methods=["POST"])
