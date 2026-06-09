@@ -8,6 +8,8 @@ import threading
 import webbrowser
 import ipaddress
 from collections import defaultdict
+from datetime import datetime
+from html import escape
 from flask import Flask, request, jsonify, send_file, render_template_string
 
 app = Flask(__name__)
@@ -590,7 +592,7 @@ def generate_checkpoint_script(rules, subnet_map=None):
 SRC_COL_INDEX = 17
 DST_COL_INDEX = 20
 
-# Columns surfaced in the bi-directional report, by header name with a
+# Columns surfaced in the audit reports, by header name with a
 # fixed-position fallback for this firewall export format.
 _REPORT_FIELDS = [
     ("Seq No.",     0),
@@ -634,38 +636,6 @@ def _col_index(header, name, default_idx):
 
 def _cell(row, idx):
     return row[idx].strip() if idx < len(row) else ""
-
-
-def scan_bidirectional(header, data):
-    """
-    Objective 1 — flag rules whose Source (col R) equals their Destination
-    (col U). Comparison is trimmed and case-insensitive. Returns a list of
-    report dicts, one per flagged rule.
-    """
-    src_idx = _col_index(header, "Source", SRC_COL_INDEX)
-    dst_idx = _col_index(header, "Destination", DST_COL_INDEX)
-
-    # Resolve report field indices once.
-    fields = [(label, _col_index(header, label, default)) for label, default in _REPORT_FIELDS]
-
-    flagged = []
-    for row in data:
-        src = _cell(row, src_idx)
-        dst = _cell(row, dst_idx)
-        if src and dst and src.lower() == dst.lower():
-            flagged.append({label: _cell(row, idx) for label, idx in fields})
-    return flagged
-
-
-def bidirectional_to_csv(flagged):
-    """Convert flagged rules to a CSV report string."""
-    output = io.StringIO()
-    columns = [label for label, _ in _REPORT_FIELDS]
-    writer = csv.writer(output)
-    writer.writerow(columns)
-    for r in flagged:
-        writer.writerow([r.get(c, "") for c in columns])
-    return output.getvalue()
 
 
 # ─────────────────────────────────────────────
@@ -819,6 +789,541 @@ def recommendations_to_csv(proposed):
     for r in proposed:
         writer.writerow([r.get(c, "") for c in _RECOMMEND_FIELDS])
     return output.getvalue()
+
+
+# ─────────────────────────────────────────────
+#  POLICY AUDIT ENGINE
+# ─────────────────────────────────────────────
+#
+# Audits every rule in the export against eight checks, each with a severity.
+# The policy starts at 1000 points and every individual finding deducts its
+# severity's points (a rule can be flagged by several checks at once); the
+# score floors at 0.
+#
+#   Critical (-6)  'Any' as source, destination, or service — ALLOW rules only
+#   High     (-4)  Overly permissive ALLOW rule: broad network objects
+#                  (/16 or wider), broad service objects (ALL_*, huge port
+#                  ranges), or very long object lists
+#   Medium   (-2)  Bi-directional: Source == Destination
+#   Medium   (-2)  Missing logging: Logged column is not true
+#   Low      (-1)  Missing comment
+#   Low      (-1)  Unused: never hit, or last hit > 180 days ago
+#   Low      (-1)  Disabled
+#   Low      (-1)  Shadowed: Shadowing Status is shadowed (NOT_SHADOWED is fine)
+
+STARTING_SCORE = 1000
+UNUSED_AFTER_DAYS = 180
+BROAD_PREFIX_LEN = 16      # a network object of /16 or wider is "broad"
+MANY_OBJECTS = 10          # more than this many objects in one field is "broad"
+BROAD_PORT_SPAN = 1000     # a service range covering more ports than this is "broad"
+
+SEVERITY_POINTS = {"Critical": 6, "High": 4, "Medium": 2, "Low": 1}
+
+# Fixed-position fallbacks for the audited columns (header name still wins).
+DEVICE_COL_INDEX = 3
+DISABLED_COL_INDEX = 14
+SERVICE_COL_INDEX = 22
+ACTION_COL_INDEX = 26
+COMMENT_COL_INDEX = 31
+LOGGED_COL_INDEX = 32
+LAST_HIT_COL_INDEX = 41
+SHADOWING_COL_INDEX = 43
+
+AUDIT_CATEGORIES = [
+    {"key": "any",           "label": "Any Src/Dst/Service", "severity": "Critical"},
+    {"key": "permissive",    "label": "Overly Permissive",   "severity": "High"},
+    {"key": "bidirectional", "label": "Bi-Directional",      "severity": "Medium"},
+    {"key": "no_logging",    "label": "Missing Logging",     "severity": "Medium"},
+    {"key": "no_comment",    "label": "Missing Comment",     "severity": "Low"},
+    {"key": "unused",        "label": "Unused Rules",        "severity": "Low"},
+    {"key": "disabled",      "label": "Disabled Rules",      "severity": "Low"},
+    {"key": "shadowed",      "label": "Shadowed Rules",      "severity": "Low"},
+]
+
+AUDIT_REPORT_COLUMNS = [label for label, _ in _REPORT_FIELDS] + ["Finding"]
+
+_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y")
+_PORT_RANGE_RE = re.compile(r"(\d{1,5})\s*-\s*(\d{1,5})")
+# 'all' as its own token, where '_'/'-' count as separators: matches ALL_TCP
+# and 'All Services' but not 'Allscripts'.
+_ALL_SERVICE_RE = re.compile(r"(?<![a-z0-9])all(?![a-z0-9])", re.IGNORECASE)
+
+
+def _is_allow(action):
+    return action.strip().lower() in ("allow", "accept", "permit")
+
+
+def _field_has_any(cell):
+    """True when a Source/Destination/Service cell contains an 'Any' object."""
+    return any(o.lower() in ("any", "*") for o in _split_objects(cell))
+
+
+def _broad_service_reason(svc_obj):
+    """Why a single service object is overly broad, or None if it isn't."""
+    if _ALL_SERVICE_RE.search(svc_obj):
+        return f"broad service '{svc_obj}'"
+    m = _PORT_RANGE_RE.search(svc_obj)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if 0 <= lo <= hi <= 65535 and hi - lo + 1 > BROAD_PORT_SPAN:
+            return f"service '{svc_obj}' spans {hi - lo + 1} ports"
+    return None
+
+
+def _parse_last_hit(value):
+    """Parse a Last Hit cell into a datetime, or None if blank/unrecognized."""
+    token = value.strip().split()[0] if value.strip() else ""
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(token, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def audit_policy(header, data, today=None):
+    """
+    Run all six checks over the parsed policy export. Returns a dict with the
+    score, the per-category findings, and the report columns.
+    """
+    today = today or datetime.now()
+    src_idx = _col_index(header, "Source", SRC_COL_INDEX)
+    dst_idx = _col_index(header, "Destination", DST_COL_INDEX)
+    svc_idx = _col_index(header, "Service", SERVICE_COL_INDEX)
+    action_idx = _col_index(header, "Action", ACTION_COL_INDEX)
+    disabled_idx = _col_index(header, "Disabled", DISABLED_COL_INDEX)
+    comment_idx = _col_index(header, "Comment", COMMENT_COL_INDEX)
+    logged_idx = _col_index(header, "Logged", LOGGED_COL_INDEX)
+    last_hit_idx = _col_index(header, "Last Hit", LAST_HIT_COL_INDEX)
+    shadow_idx = _col_index(header, "Shadowing Status", SHADOWING_COL_INDEX)
+    device_idx = _col_index(header, "Device Name", DEVICE_COL_INDEX)
+    fields = [(label, _col_index(header, label, default)) for label, default in _REPORT_FIELDS]
+
+    findings = {c["key"]: [] for c in AUDIT_CATEGORIES}
+    devices = []
+    rules_with_findings = 0
+
+    def flag(key, row, detail):
+        report = {label: _cell(row, idx) for label, idx in fields}
+        report["Finding"] = detail
+        findings[key].append(report)
+
+    for row in data:
+        flags_before = sum(len(v) for v in findings.values())
+        src = _cell(row, src_idx)
+        dst = _cell(row, dst_idx)
+        svc = _cell(row, svc_idx)
+        disabled = _cell(row, disabled_idx).lower() in ("true", "yes", "1", "disabled")
+        allow = _is_allow(_cell(row, action_idx))
+
+        device = _cell(row, device_idx)
+        if device and device not in devices:
+            devices.append(device)
+
+        # Critical — 'Any' as source, destination, or service on an ALLOW rule.
+        # (An Any-Any-Any drop/cleanup rule is normal practice, so deny rules
+        # are exempt.)
+        if allow:
+            any_fields = [name for name, cell in
+                          (("Source", src), ("Destination", dst), ("Service", svc))
+                          if _field_has_any(cell)]
+            if any_fields:
+                flag("any", row, "Any in " + " + ".join(any_fields))
+
+        # High — overly permissive ALLOW rule.
+        if allow:
+            reasons = []
+            for side, cell in (("Source", src), ("Destination", dst)):
+                objs = _split_objects(cell)
+                for o in objs:
+                    net = _object_network(o)
+                    if net is not None and net.prefixlen <= BROAD_PREFIX_LEN:
+                        reasons.append(f"{side} has broad network {net} ({o})")
+                if len(objs) > MANY_OBJECTS:
+                    reasons.append(f"{side} lists {len(objs)} objects")
+            svc_objs = _split_objects(svc)
+            for o in svc_objs:
+                reason = _broad_service_reason(o)
+                if reason:
+                    reasons.append(reason)
+            if len(svc_objs) > MANY_OBJECTS:
+                reasons.append(f"Service lists {len(svc_objs)} objects")
+            if reasons:
+                flag("permissive", row, "; ".join(reasons))
+
+        # Medium — bi-directional: Source == Destination (trimmed, case-insensitive).
+        # Any==Any is excluded: that's the 'Any' problem, not a bi-directional one.
+        if src and dst and src.lower() == dst.lower() and not _field_has_any(src):
+            flag("bidirectional", row, "Source and Destination are identical")
+
+        # Medium — missing logging. Disabled rules are skipped: an inactive
+        # rule isn't logging anything by definition and is already flagged below.
+        if not disabled:
+            logged = _cell(row, logged_idx).lower()
+            if logged not in ("true", "yes", "1", "log", "enabled"):
+                flag("no_logging", row,
+                     f"Logging is '{_cell(row, logged_idx)}'" if logged else "Logging not set")
+
+        # Low — missing comment.
+        if not _cell(row, comment_idx):
+            flag("no_comment", row, "No comment")
+
+        # Low — unused. Disabled rules are skipped: they can't accrue hits
+        # and are already flagged below.
+        if not disabled:
+            last_hit_raw = _cell(row, last_hit_idx)
+            if not last_hit_raw:
+                flag("unused", row, "Never hit")
+            else:
+                hit = _parse_last_hit(last_hit_raw)
+                if hit is not None:
+                    age = (today - hit).days
+                    if age > UNUSED_AFTER_DAYS:
+                        flag("unused", row, f"Last hit {last_hit_raw} ({age} days ago)")
+
+        # Low — disabled.
+        if disabled:
+            flag("disabled", row, "Rule is disabled")
+
+        # Low — shadowed: an earlier rule already matches this traffic.
+        # Disabled rules are skipped; shadowing only matters for active rules.
+        if not disabled:
+            shadow_raw = _cell(row, shadow_idx)
+            shadow = shadow_raw.lower()
+            if "shadowed" in shadow and not shadow.startswith("not"):
+                flag("shadowed", row, f"Shadowing status: {shadow_raw}")
+
+        if sum(len(v) for v in findings.values()) > flags_before:
+            rules_with_findings += 1
+
+    categories = []
+    deductions = 0
+    for cat in AUDIT_CATEGORIES:
+        rules = findings[cat["key"]]
+        points = SEVERITY_POINTS[cat["severity"]]
+        deductions += points * len(rules)
+        categories.append({**cat, "points": points, "count": len(rules), "rules": rules})
+
+    return {
+        "total_rules": len(data),
+        "score": max(0, STARTING_SCORE - deductions),
+        "starting_score": STARTING_SCORE,
+        "deductions": deductions,
+        "devices": devices,
+        "rules_with_findings": rules_with_findings,
+        "columns": AUDIT_REPORT_COLUMNS,
+        "categories": categories,
+    }
+
+
+def audit_to_csv(result, category_key=None):
+    """
+    Export findings as CSV — one category when category_key is given,
+    otherwise every finding with its category and severity.
+    """
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Category", "Severity"] + result["columns"])
+    for cat in result["categories"]:
+        if category_key and cat["key"] != category_key:
+            continue
+        for r in cat["rules"]:
+            writer.writerow([cat["label"], cat["severity"]]
+                            + [r.get(c, "") for c in result["columns"]])
+    return output.getvalue()
+
+
+# ─────────────────────────────────────────────
+#  AUDIT REPORTS (EXECUTIVE / ENGINEER)
+# ─────────────────────────────────────────────
+#
+# Both reports are generated as fully self-contained HTML documents on a light,
+# print-friendly theme, so they can be opened anywhere, printed, or saved to
+# PDF from the browser — no extra dependencies.
+
+# Light-theme palette used in the downloadable reports (the app UI's neon
+# colors don't read well on white).
+_REPORT_SEVERITY_COLORS = {
+    "Critical": "#c0392b",
+    "High":     "#d35400",
+    "Medium":   "#b07d00",
+    "Low":      "#2471a3",
+}
+
+
+def _report_band(score):
+    """(label, color) for the score on the light report theme — same
+    thresholds as the UI's bandFor()."""
+    if score > 950:
+        return "Excellent", "#1e8e5a"
+    if score > 800:
+        return "Good", "#b07d00"
+    if score >= 600:
+        return "At Risk", "#d35400"
+    return "Critical", "#c0392b"
+
+
+# Plain-business-language explanation of each category, for the executive
+# report. Keyed by category key; {n} is the finding count.
+_EXEC_NARRATIVES = {
+    "any": "{n} rule(s) allow traffic from any source, to any destination, or on "
+           "any service. These grant the broadest possible access and are the most "
+           "likely path for an attacker or malware to move through the network.",
+    "permissive": "{n} rule(s) grant access far more broadly than necessary — entire "
+                  "networks or very large service ranges — which increases the impact "
+                  "of any single compromised system.",
+    "bidirectional": "{n} rule(s) allow traffic in both directions between the same "
+                     "systems, which usually grants more access than the business "
+                     "need requires.",
+    "no_logging": "{n} rule(s) do not record traffic logs, creating blind spots for "
+                  "security monitoring, incident response, and audits.",
+    "no_comment": "{n} rule(s) have no documentation, making it difficult to know why "
+                  "the access exists or whether it is still required.",
+    "unused": f"{{n}} rule(s) have not matched any traffic in over {UNUSED_AFTER_DAYS} "
+              "days, suggesting the access is no longer needed and can likely be removed.",
+    "disabled": "{n} rule(s) are disabled but still present in the policy, adding "
+                "clutter and the risk of accidental re-enablement.",
+    "shadowed": "{n} rule(s) are shadowed — earlier rules always match first, so these "
+                "are dead weight that complicates the policy.",
+}
+
+# Step-by-step remediation guidance per category, for the engineer report.
+_ENGINEER_STEPS = {
+    "any": [
+        "Export this category to CSV and treat it as your highest-priority worklist.",
+        "For each rule, gather the traffic it actually carries (hit logs or a traffic query).",
+        "Feed a traffic-hit CSV into the Rule Analyzer tool to generate least-permissive replacement rules.",
+        "Stage the replacement rules above the Any rule, monitor for a change window, then remove the Any rule.",
+    ],
+    "permissive": [
+        "Identify what actually needs the access: narrow broad networks (/16 or wider) to the specific subnets or hosts in use.",
+        "Replace ALL_* or wide port-range services with the specific protocol/ports observed in traffic.",
+        "Where many objects are listed in one rule, split by application or use object groups with meaningful names.",
+        "Validate with traffic data before and after each change.",
+    ],
+    "bidirectional": [
+        "In the Policy Scanner, select the flagged rules and click Recommendations to generate uni-directional splits.",
+        "Confirm with the application owner which direction(s) are genuinely initiated.",
+        "Implement the needed direction(s), monitor, then remove the bi-directional rule.",
+    ],
+    "no_logging": [
+        "Enable logging on each flagged rule — this is a low-risk change.",
+        "Confirm logs are forwarded to your SIEM / log collector.",
+        "Adopt a standard: every new rule ships with logging enabled.",
+    ],
+    "no_comment": [
+        "Add a comment with the change ticket, requester/owner, and purpose for each rule.",
+        "Where the purpose is unknown, treat the rule as a candidate for the unused-rule review below.",
+        "Enforce a comment standard for all future changes.",
+    ],
+    "unused": [
+        f"Confirm the rule has had no hits for at least {UNUSED_AFTER_DAYS} days (extend the window for yearly batch jobs / DR paths).",
+        "Disable the rule first rather than deleting it.",
+        "After a full change cycle with no impact, delete it.",
+    ],
+    "disabled": [
+        "Confirm no pending change or seasonal process still needs the rule.",
+        "Delete disabled rules that have no documented reason to remain.",
+    ],
+    "shadowed": [
+        "Identify the earlier rule(s) that shadow each flagged rule.",
+        "If the shadowing rule is correct, delete the shadowed rule; if not, fix the ordering.",
+        "Re-run the export afterwards to confirm the shadowing is resolved.",
+    ],
+}
+
+# Columns shown in the engineer report's per-category tables, and the row cap
+# per table (the CSV export carries the full list).
+_ENGINEER_TABLE_COLUMNS = ["Seq No.", "Rule Name", "Source", "Destination",
+                           "Service", "Action", "Finding"]
+_ENGINEER_TABLE_MAX_ROWS = 40
+
+_REPORT_CSS = """
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; color: #1f2d3d; background: #f4f6f8; line-height: 1.55; }
+  .page { max-width: 860px; margin: 0 auto; padding: 48px 56px; background: #fff; }
+  header { border-bottom: 3px solid #1f2d3d; padding-bottom: 18px; margin-bottom: 28px; }
+  h1 { font-size: 1.7rem; letter-spacing: -0.01em; }
+  .meta { color: #5a6b7e; font-size: 0.85rem; margin-top: 6px; }
+  h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: 0.08em;
+       border-bottom: 1px solid #d8dee5; padding-bottom: 6px; margin: 30px 0 14px; }
+  p, li { font-size: 0.92rem; }
+  ul, ol { padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin: 10px 0; }
+  th { background: #1f2d3d; color: #fff; text-align: left; padding: 8px 10px; font-weight: 600; }
+  td { padding: 7px 10px; border-bottom: 1px solid #e3e8ee; vertical-align: top; }
+  tr:nth-child(even) td { background: #f7f9fb; }
+  .sev { display: inline-block; padding: 1px 9px; border-radius: 3px; color: #fff;
+         font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em; }
+  .score-hero { display: flex; align-items: center; gap: 28px; background: #f7f9fb;
+                border: 1px solid #e3e8ee; border-radius: 6px; padding: 22px 28px; }
+  .score-hero .num { font-size: 3.4rem; font-weight: 700; line-height: 1; }
+  .score-hero .of { color: #5a6b7e; font-size: 1rem; }
+  .score-hero .band { display: inline-block; margin-top: 6px; padding: 3px 12px;
+                      border-radius: 3px; color: #fff; font-size: 0.78rem;
+                      font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  .score-hero .desc { font-size: 0.88rem; color: #3c4d61; }
+  .device { font-weight: 700; }
+  .phase { margin-bottom: 26px; }
+  .phase h3 { font-size: 0.95rem; margin-bottom: 6px; }
+  .phase .why { color: #5a6b7e; font-size: 0.85rem; font-style: italic; margin-bottom: 8px; }
+  .more { color: #5a6b7e; font-size: 0.8rem; font-style: italic; }
+  footer { margin-top: 36px; padding-top: 14px; border-top: 1px solid #d8dee5;
+           color: #8294a7; font-size: 0.75rem; }
+  @media print {
+    body { background: #fff; }
+    .page { padding: 0; max-width: none; }
+    .phase, .score-hero { break-inside: avoid; }
+  }
+"""
+
+
+def _report_head(title):
+    return ("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            f"<title>{escape(title)}</title><style>{_REPORT_CSS}</style></head><body>"
+            "<div class=\"page\">")
+
+
+def _report_meta_line(result):
+    devices = ", ".join(result["devices"]) or "unknown device"
+    date = datetime.now().strftime("%B %d, %Y")
+    return (f"Device(s): <span class=\"device\">{escape(devices)}</span> &middot; "
+            f"Generated {date} &middot; {result['total_rules']} rule(s) reviewed")
+
+
+def _report_footer():
+    return ("<footer>Generated by Firewall Rule Analyzer &mdash; Policy Scanner. "
+            "Score bands: above 950 Excellent &middot; above 800 Good &middot; "
+            "600&ndash;800 At Risk &middot; below 600 Critical.</footer>"
+            "</div></body></html>")
+
+
+def _sev_chip(severity):
+    color = _REPORT_SEVERITY_COLORS[severity]
+    return f"<span class=\"sev\" style=\"background:{color}\">{severity}</span>"
+
+
+def _findings_table(result):
+    out = ["<table><tr><th>Severity</th><th>Category</th><th>Findings</th>"
+           "<th>Points Deducted</th></tr>"]
+    for cat in result["categories"]:
+        deducted = cat["count"] * cat["points"]
+        out.append(f"<tr><td>{_sev_chip(cat['severity'])}</td>"
+                   f"<td>{escape(cat['label'])}</td>"
+                   f"<td>{cat['count']}</td><td>&minus;{deducted}</td></tr>")
+    out.append(f"<tr><td></td><td><b>Total</b></td>"
+               f"<td><b>{sum(c['count'] for c in result['categories'])}</b></td>"
+               f"<td><b>&minus;{result['deductions']}</b></td></tr></table>")
+    return "".join(out)
+
+
+def _score_hero(result, extra_desc=""):
+    band, color = _report_band(result["score"])
+    pct = (100.0 * result["rules_with_findings"] / result["total_rules"]) if result["total_rules"] else 0.0
+    desc = (f"{result['rules_with_findings']} of {result['total_rules']} rule(s) "
+            f"({pct:.0f}%) have at least one finding; the policy lost "
+            f"{result['deductions']} of {result['starting_score']} points.")
+    return (f"<div class=\"score-hero\"><div><span class=\"num\" style=\"color:{color}\">"
+            f"{result['score']}</span><span class=\"of\"> / {result['starting_score']}</span><br>"
+            f"<span class=\"band\" style=\"background:{color}\">{band}</span></div>"
+            f"<div class=\"desc\">{desc} {extra_desc}</div></div>")
+
+
+def generate_executive_report(result):
+    """A leadership-facing HTML summary: score, findings table, plain-language
+    risk narrative, and recommended next steps."""
+    parts = [_report_head("Firewall Policy Security Report")]
+    parts.append("<header><h1>Firewall Policy Security Report</h1>"
+                 f"<div class=\"meta\">{_report_meta_line(result)}</div></header>")
+    parts.append("<h2>Security Score</h2>")
+    parts.append(_score_hero(
+        result, "The score starts at 1000 and each finding deducts points by severity "
+                "(Critical &minus;6, High &minus;4, Medium &minus;2, Low &minus;1)."))
+
+    parts.append("<h2>Findings at a Glance</h2>")
+    parts.append(_findings_table(result))
+
+    parts.append("<h2>What This Means</h2>")
+    flagged = [c for c in result["categories"] if c["count"]]
+    if flagged:
+        parts.append("<ul>")
+        for cat in flagged:
+            text = _EXEC_NARRATIVES[cat["key"]].format(n=cat["count"])
+            parts.append(f"<li><b>{escape(cat['label'])}</b> ({cat['severity']}): {text}</li>")
+        parts.append("</ul>")
+    else:
+        parts.append("<p>No issues were found. The policy meets all eight audit checks.</p>")
+
+    parts.append("<h2>Recommended Next Steps</h2><ol>"
+                 "<li>Remediate Critical and High findings first — replace any-access and "
+                 "overly broad rules with least-privilege rules based on observed traffic.</li>"
+                 "<li>Schedule a hygiene cleanup: enable logging, document rules, and remove "
+                 "unused, disabled, and shadowed rules.</li>"
+                 "<li>Adopt standards so new rules ship with logging, documentation, and "
+                 "least-privilege scope by default.</li>"
+                 "<li>Re-run this audit after each remediation cycle and track the score "
+                 "as the policy-health KPI.</li></ol>")
+    parts.append(_report_footer())
+    return "".join(parts)
+
+
+def generate_engineer_report(result):
+    """An engineer-facing HTML runbook: prioritized phases, step-by-step
+    remediation guidance, and the flagged rules for each category."""
+    parts = [_report_head("Firewall Policy Cleanup Plan")]
+    parts.append("<header><h1>Firewall Policy Cleanup Plan</h1>"
+                 f"<div class=\"meta\">{_report_meta_line(result)}</div></header>")
+    parts.append("<h2>Current State</h2>")
+    parts.append(_score_hero(result))
+
+    parts.append("<h2>Before You Start</h2><ul>"
+                 "<li>Take a full backup/export of the current policy.</li>"
+                 "<li>Work through the phases in order — highest severity first.</li>"
+                 "<li>Make changes in small batches under change control, and monitor "
+                 "after each batch.</li>"
+                 "<li>Export each category to CSV from the Policy Scanner for the full "
+                 "worklists; tables below are capped at "
+                 f"{_ENGINEER_TABLE_MAX_ROWS} rows.</li></ul>")
+
+    phase_num = 0
+    for cat in result["categories"]:
+        if not cat["count"]:
+            continue
+        phase_num += 1
+        parts.append(f"<div class=\"phase\"><h3>Phase {phase_num}: {escape(cat['label'])} "
+                     f"&mdash; {_sev_chip(cat['severity'])} "
+                     f"({cat['count']} rule(s), &minus;{cat['count'] * cat['points']} points)</h3>")
+        parts.append(f"<div class=\"why\">{escape(_EXEC_NARRATIVES[cat['key']].format(n=cat['count']))}</div>")
+        parts.append("<ol>")
+        for step in _ENGINEER_STEPS[cat["key"]]:
+            parts.append(f"<li>{escape(step)}</li>")
+        parts.append("</ol>")
+
+        parts.append("<table><tr>" +
+                     "".join(f"<th>{escape(c)}</th>" for c in _ENGINEER_TABLE_COLUMNS) +
+                     "</tr>")
+        for r in cat["rules"][:_ENGINEER_TABLE_MAX_ROWS]:
+            parts.append("<tr>" + "".join(
+                f"<td>{escape(r.get(c, ''))}</td>" for c in _ENGINEER_TABLE_COLUMNS) + "</tr>")
+        parts.append("</table>")
+        remaining = cat["count"] - _ENGINEER_TABLE_MAX_ROWS
+        if remaining > 0:
+            parts.append(f"<p class=\"more\">&hellip; and {remaining} more — export the "
+                         "category CSV for the full list.</p>")
+        parts.append("</div>")
+
+    if phase_num == 0:
+        parts.append("<h2>Remediation Phases</h2>"
+                     "<p>No findings — there is nothing to clean up. Re-run the audit "
+                     "after the next policy change.</p>")
+
+    parts.append("<h2>After Each Phase</h2><ul>"
+                 "<li>Re-export the policy and re-run the Policy Scanner to confirm the "
+                 "findings are resolved and the score improved.</li>"
+                 "<li>Record the changes and updated score for the next review.</li></ul>")
+    parts.append(_report_footer())
+    return "".join(parts)
 
 
 # ─────────────────────────────────────────────
@@ -1718,7 +2223,7 @@ HOME_HTML = r"""
         </svg>
       </div>
       <h2>Policy Scanner</h2>
-      <p>Review a policy export for issues. Flags bi-directional rules, then recommends how to break selected rules into least-permissive uni-directional rules.</p>
+      <p>Audit a policy export against eight severity-rated checks (Any, overly permissive, bi-directional, missing logging, missing comment, unused, disabled, shadowed), score it out of 1000, and export findings to CSV.</p>
       <span class="tool-go">Open scanner &rarr;</span>
     </a>
 
@@ -1789,16 +2294,60 @@ SCANNER_HTML = r"""
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .stats-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 16px;
-    margin-bottom: 28px;
+  /* Score dashboard */
+  .score-wrap { display: flex; align-items: center; justify-content: center; gap: 48px; flex-wrap: wrap; margin-bottom: 28px; }
+  .score-main { text-align: center; }
+  #gauge { display: block; width: 260px; max-width: 100%; margin: 0 auto; overflow: visible; }
+  #gauge text { font-family: var(--mono); font-size: 8px; fill: var(--muted); letter-spacing: 0.05em; }
+  #gauge-fill { transition: stroke 0.4s; }
+  #gauge-needle {
+    transform-box: view-box;
+    transform-origin: 110px 112px;
+    transition: transform 0.9s cubic-bezier(0.4, 0, 0.2, 1);
   }
-  .stat { background: rgba(0,212,255,0.04); border: 1px solid var(--border); padding: 16px; text-align: center; }
-  .stat-value { font-family: var(--mono); font-size: 1.8rem; font-weight: 700; color: var(--accent); display: block; }
-  .stat-value.warn { color: var(--accent2); }
-  .stat-label { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-top: 4px; display: block; }
+  .score-readout { margin-top: 6px; }
+  .score-value { font-family: var(--mono); font-size: 2.6rem; font-weight: 700; line-height: 1; }
+  .score-denom { font-family: var(--mono); font-size: 0.85rem; color: var(--muted); }
+  .score-band {
+    display: inline-block;
+    font-family: var(--mono); font-size: 0.7rem;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    padding: 4px 14px; border: 1px solid currentColor; margin-top: 10px;
+  }
+  .score-side { flex: 0 1 auto; min-width: 260px; }
+  .score-device {
+    font-family: var(--mono); font-size: 0.7rem;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 16px;
+  }
+  .score-device b { font-family: var(--sans); font-size: 1.15rem; font-weight: 800; letter-spacing: 0.04em; }
+  .score-math { font-family: var(--mono); font-size: 0.78rem; color: var(--text); margin-top: 12px; }
+  .score-legend { font-family: var(--mono); font-size: 0.65rem; letter-spacing: 0.08em; color: var(--muted); margin-top: 6px; }
+  .score-actions { display: flex; flex-direction: column; gap: 12px; }
+  .btn-sm { padding: 11px 18px; font-size: 0.72rem; justify-content: flex-start; }
+
+  /* Severity palette */
+  .sev-critical { --sev: #ff4757; }
+  .sev-high     { --sev: #ff6b35; }
+  .sev-medium   { --sev: #ffd166; }
+  .sev-low      { --sev: #00d4ff; }
+
+  /* Category cards */
+  .cat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .cat-card {
+    border: 1px solid var(--border);
+    background: rgba(255,255,255,0.02);
+    padding: 14px 10px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .cat-card:hover { border-color: var(--sev); }
+  .cat-card.active { border-color: var(--sev); background: rgba(255,255,255,0.05); box-shadow: 0 0 14px rgba(0,0,0,0.4); }
+  .cat-count { font-family: var(--mono); font-size: 1.7rem; font-weight: 700; color: var(--sev); display: block; }
+  .cat-card.clean .cat-count { color: var(--success); }
+  .cat-label { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text); margin-top: 4px; display: block; }
+  .cat-sev { font-family: var(--mono); font-size: 0.6rem; color: var(--muted); margin-top: 4px; display: block; }
 
   .table-wrap { overflow-x: auto; max-height: 480px; overflow-y: auto; }
   table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.8rem; }
@@ -1883,7 +2432,7 @@ SCANNER_HTML = r"""
     </div>
     <div class="header-text">
       <h1>Policy Scanner</h1>
-      <p>// bi-directional detection &middot; uni-directional split recommendations</p>
+      <p>// eight-point policy audit &middot; security score &middot; split recommendations</p>
     </div>
     <a class="back-link" href="/">&larr; Toolbox</a>
   </header>
@@ -1894,7 +2443,7 @@ SCANNER_HTML = r"""
       <input type="file" id="file-input" accept=".csv">
       <div class="drop-icon">📂</div>
       <div class="drop-title">Drop your policy CSV here</div>
-      <div class="drop-sub">or click to browse &nbsp;·&nbsp; first 3 lines are ignored &nbsp;·&nbsp; flags rules where Source = Destination</div>
+      <div class="drop-sub">or click to browse &nbsp;·&nbsp; first 3 lines are ignored &nbsp;·&nbsp; checks: Any &middot; permissive &middot; bi-directional &middot; no logging &middot; no comment &middot; unused &middot; disabled &middot; shadowed</div>
     </div>
     <div id="file-name"></div>
 
@@ -1914,27 +2463,79 @@ SCANNER_HTML = r"""
     </div>
   </div>
 
-  <div id="results" class="card">
-    <div class="card-label">02 &mdash; Bi-Directional Rules</div>
-    <div class="stats-row" id="stats-row"></div>
-    <div id="select-info" style="display:none;"></div>
-    <div id="report-area"></div>
-    <div class="actions actions-row" id="download-actions" style="display:none;">
-      <button class="btn btn-primary" id="recommend-btn" disabled>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M9 18h6M10 22h4"/>
-          <path d="M12 2a7 7 0 00-4 12.7c.6.5 1 1.3 1 2.1V17h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0012 2z"/>
-        </svg>
-        Recommendations
-      </button>
-      <button class="btn btn-secondary" id="download-btn">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-          <polyline points="7 10 12 15 17 10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        Download Report CSV
-      </button>
+  <div id="results">
+    <div class="card">
+      <div class="card-label">02 &mdash; Score Dashboard</div>
+      <div class="score-wrap">
+        <div class="score-main">
+          <svg id="gauge" viewBox="0 0 220 134" role="img" aria-label="Policy score gauge">
+            <g id="gauge-track"></g>
+            <path id="gauge-fill" fill="none" stroke-width="13" stroke-linecap="round"/>
+            <g id="gauge-needle">
+              <line x1="110" y1="112" x2="42" y2="112" stroke="#c8d8e8" stroke-width="2.5"/>
+            </g>
+            <circle cx="110" cy="112" r="6.5" fill="#0f1520" stroke="#c8d8e8" stroke-width="2"/>
+          </svg>
+          <div class="score-readout">
+            <span class="score-value" id="score-value">&mdash;</span><span class="score-denom"> / 1000</span>
+          </div>
+          <span class="score-band" id="score-band"></span>
+        </div>
+        <div class="score-side">
+          <div class="score-device" id="score-device" style="display:none;">// device: <b id="device-name"></b></div>
+          <div class="score-math" id="score-math"></div>
+          <div class="score-legend">critical &minus;6 &middot; high &minus;4 &middot; medium &minus;2 &middot; low &minus;1 per finding</div>
+        </div>
+        <div class="score-actions">
+          <button class="btn btn-secondary btn-sm" id="exec-report-btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="8" y1="13" x2="16" y2="13"/>
+              <line x1="8" y1="17" x2="13" y2="17"/>
+            </svg>
+            Executive Report
+          </button>
+          <button class="btn btn-secondary btn-sm" id="eng-report-btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>
+            </svg>
+            Engineer Cleanup Plan
+          </button>
+        </div>
+      </div>
+      <div class="cat-grid" id="cat-grid"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">03 &mdash; Findings &middot; <span id="cat-title"></span></div>
+      <div id="select-info" style="display:none;"></div>
+      <div id="report-area"></div>
+      <div class="actions actions-row" id="download-actions" style="display:none;">
+        <button class="btn btn-primary" id="recommend-btn" disabled style="display:none;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M9 18h6M10 22h4"/>
+            <path d="M12 2a7 7 0 00-4 12.7c.6.5 1 1.3 1 2.1V17h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0012 2z"/>
+          </svg>
+          Recommendations
+        </button>
+        <button class="btn btn-secondary" id="download-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Export Category CSV
+        </button>
+        <button class="btn btn-secondary" id="download-all-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Export All Findings CSV
+        </button>
+      </div>
     </div>
   </div>
 
@@ -1969,10 +2570,20 @@ SCANNER_HTML = r"""
   const statusMsg = document.getElementById('status-msg');
   const spinner   = document.getElementById('spinner');
   const resultsEl = document.getElementById('results');
-  const statsRow  = document.getElementById('stats-row');
+  const scoreValue = document.getElementById('score-value');
+  const scoreBand = document.getElementById('score-band');
+  const gaugeFill = document.getElementById('gauge-fill');
+  const gaugeNeedle = document.getElementById('gauge-needle');
+  const gaugeNeedleLine = gaugeNeedle.querySelector('line');
+  const scoreDevice = document.getElementById('score-device');
+  const deviceName = document.getElementById('device-name');
+  const scoreMath = document.getElementById('score-math');
+  const catGrid = document.getElementById('cat-grid');
+  const catTitle = document.getElementById('cat-title');
   const reportArea = document.getElementById('report-area');
   const downloadActions = document.getElementById('download-actions');
   const downloadBtn = document.getElementById('download-btn');
+  const downloadAllBtn = document.getElementById('download-all-btn');
   const recommendBtn = document.getElementById('recommend-btn');
   const selectInfo = document.getElementById('select-info');
   const recModal = document.getElementById('rec-modal');
@@ -1982,7 +2593,9 @@ SCANNER_HTML = r"""
   const recActions = document.getElementById('rec-actions');
   const recDownloadBtn = document.getElementById('rec-download-btn');
 
-  let currentFlagged = [];      // flagged rules from the latest scan
+  let auditData = null;         // full audit result from the latest scan
+  let activeCat = null;         // key of the category shown in the findings table
+  let currentFlagged = [];      // bi-directional rules (feed the recommendations flow)
   let lastRecommendRules = [];  // rules sent to the most recent recommendation
 
   dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
@@ -2025,7 +2638,8 @@ SCANNER_HTML = r"""
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
       renderResults(data);
-      setStatus('ok', `Done — ${data.flagged.length} bi-directional rule(s) found in ${data.total_rules} rule(s).`);
+      const findings = data.categories.reduce((sum, c) => sum + c.count, 0);
+      setStatus('ok', `Done — score ${data.score}/${data.starting_score}, ${findings} finding(s) across ${data.total_rules} rule(s).`);
     } catch (err) {
       setStatus('error', 'Error: ' + err.message);
     } finally {
@@ -2033,39 +2647,129 @@ SCANNER_HTML = r"""
     }
   });
 
-  function renderResults(data) {
-    const count = data.flagged.length;
-    currentFlagged = data.flagged;
-    statsRow.innerHTML = `
-      <div class="stat"><span class="stat-value">${data.total_rules}</span><span class="stat-label">Rules Scanned</span></div>
-      <div class="stat"><span class="stat-value ${count ? 'warn' : ''}">${count}</span><span class="stat-label">Bi-Directional</span></div>
-    `;
+  // Score bands: >950 green, >800 yellow, 600–800 orange, <600 red.
+  function bandFor(score) {
+    if (score > 950) return { color: '#00ff9d', label: 'Excellent' };
+    if (score > 800) return { color: '#ffd166', label: 'Good' };
+    if (score >= 600) return { color: '#ff6b35', label: 'At Risk' };
+    return { color: '#ff4757', label: 'Critical' };
+  }
 
-    if (!count) {
-      reportArea.innerHTML = '<div class="empty">✓ No bi-directional rules found — no rule has an identical source and destination.</div>';
-      downloadActions.style.display = 'none';
-      selectInfo.style.display = 'none';
+  // ── Speedometer gauge ─────────────────────────────────────────
+  // Semicircle centred at (110,112), radius 90; fraction 0 is the left end,
+  // fraction 1 the right end.
+  function gaugePoint(f, r) {
+    const th = Math.PI * (1 - f);
+    return [110 + r * Math.cos(th), 112 - r * Math.sin(th)];
+  }
+  function gaugeArc(f1, f2, r) {
+    const [x1, y1] = gaugePoint(f1, r), [x2, y2] = gaugePoint(f2, r);
+    return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 0 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+  }
+  (function initGauge() {
+    // Dim track segments showing the score bands, threshold ticks, end labels.
+    const bands = [[0, 0.6, '#ff4757'], [0.6, 0.8, '#ff6b35'], [0.8, 0.95, '#ffd166'], [0.95, 1, '#00ff9d']];
+    let html = '';
+    bands.forEach(([f1, f2, color]) => {
+      html += `<path d="${gaugeArc(f1, f2, 90)}" fill="none" stroke="${color}" stroke-opacity="0.22" stroke-width="13"/>`;
+    });
+    [[0.6, '600'], [0.8, '800'], [0.95, '950']].forEach(([f, label]) => {
+      const [x1, y1] = gaugePoint(f, 81), [x2, y2] = gaugePoint(f, 99);
+      html += `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="#4a6080" stroke-width="1"/>`;
+      const [tx, ty] = gaugePoint(f, 108);
+      html += `<text x="${tx.toFixed(2)}" y="${ty.toFixed(2)}" text-anchor="middle" dominant-baseline="middle">${label}</text>`;
+    });
+    html += '<text x="20" y="129" text-anchor="middle">0</text><text x="200" y="129" text-anchor="middle">1000</text>';
+    document.getElementById('gauge-track').innerHTML = html;
+  })();
+
+  function renderResults(data) {
+    auditData = data;
+    const bidir = data.categories.find(c => c.key === 'bidirectional');
+    currentFlagged = bidir ? bidir.rules : [];
+
+    const band = bandFor(data.score);
+    scoreValue.textContent = data.score;
+    scoreValue.style.color = band.color;
+    scoreValue.style.textShadow = `0 0 24px ${band.color}55`;
+    scoreBand.textContent = band.label;
+    scoreBand.style.color = band.color;
+
+    const f = Math.max(0, Math.min(1, data.score / data.starting_score));
+    gaugeFill.setAttribute('d', f > 0.001 ? gaugeArc(0, f, 90) : '');
+    gaugeFill.setAttribute('stroke', band.color);
+    gaugeFill.style.filter = `drop-shadow(0 0 5px ${band.color})`;
+    gaugeNeedle.style.transform = `rotate(${(180 * f).toFixed(1)}deg)`;
+    gaugeNeedleLine.setAttribute('stroke', band.color);
+
+    if (data.devices && data.devices.length) {
+      deviceName.textContent = data.devices.join(', ');
+      deviceName.style.color = band.color;
+      deviceName.style.textShadow = `0 0 18px ${band.color}55`;
+      scoreDevice.style.display = 'block';
     } else {
-      const cols = data.columns;
-      let html = '<div class="table-wrap"><table><thead><tr>';
-      html += '<th class="check-cell"><input type="checkbox" id="select-all" title="Select all"></th>';
-      cols.forEach(c => { html += `<th>${escapeHtml(c)}</th>`; });
-      html += '</tr></thead><tbody>';
-      data.flagged.forEach((r, i) => {
-        html += '<tr>';
-        html += `<td class="check-cell"><input type="checkbox" class="row-check" data-idx="${i}"></td>`;
-        cols.forEach(c => { html += `<td>${escapeHtml(r[c])}</td>`; });
-        html += '</tr>';
-      });
-      html += '</tbody></table></div>';
-      reportArea.innerHTML = html;
-      downloadActions.style.display = 'flex';
-      selectInfo.style.display = 'block';
-      updateSelection();
+      scoreDevice.style.display = 'none';
     }
+
+    scoreMath.textContent = `${data.starting_score} start − ${data.deductions} deducted · ${data.total_rules} rule(s) scanned`;
+
+    const firstWithFindings = data.categories.find(c => c.count > 0);
+    activeCat = (firstWithFindings || data.categories[0]).key;
+    renderCatGrid();
+    renderCategory(activeCat);
 
     resultsEl.classList.add('visible');
     resultsEl.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  function renderCatGrid() {
+    catGrid.innerHTML = auditData.categories.map(c => `
+      <div class="cat-card sev-${c.severity.toLowerCase()}${c.key === activeCat ? ' active' : ''}${c.count ? '' : ' clean'}" data-key="${c.key}">
+        <span class="cat-count">${c.count}</span>
+        <span class="cat-label">${escapeHtml(c.label)}</span>
+        <span class="cat-sev">${c.severity} · −${c.points} each</span>
+      </div>`).join('');
+  }
+
+  catGrid.addEventListener('click', e => {
+    const card = e.target.closest('.cat-card');
+    if (!card || !auditData) return;
+    activeCat = card.dataset.key;
+    renderCatGrid();
+    renderCategory(activeCat);
+  });
+
+  function renderCategory(key) {
+    const cat = auditData.categories.find(c => c.key === key);
+    const isBidir = key === 'bidirectional';
+    const totalFindings = auditData.categories.reduce((sum, c) => sum + c.count, 0);
+    catTitle.textContent = `${cat.label} — ${cat.severity}`;
+    recommendBtn.style.display = (isBidir && cat.count) ? 'inline-flex' : 'none';
+    selectInfo.style.display = (isBidir && cat.count) ? 'block' : 'none';
+
+    if (!cat.count) {
+      reportArea.innerHTML = `<div class="empty">✓ No findings in this category.</div>`;
+      downloadBtn.style.display = 'none';
+      downloadActions.style.display = totalFindings ? 'flex' : 'none';
+      return;
+    }
+
+    const cols = auditData.columns;
+    let html = '<div class="table-wrap"><table><thead><tr>';
+    if (isBidir) html += '<th class="check-cell"><input type="checkbox" id="select-all" title="Select all"></th>';
+    cols.forEach(c => { html += `<th>${escapeHtml(c)}</th>`; });
+    html += '</tr></thead><tbody>';
+    cat.rules.forEach((r, i) => {
+      html += '<tr>';
+      if (isBidir) html += `<td class="check-cell"><input type="checkbox" class="row-check" data-idx="${i}"></td>`;
+      cols.forEach(c => { html += `<td>${escapeHtml(r[c])}</td>`; });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+    reportArea.innerHTML = html;
+    downloadBtn.style.display = 'inline-flex';
+    downloadActions.style.display = 'flex';
+    if (isBidir) updateSelection();
   }
 
   function getSelectedRules() {
@@ -2093,19 +2797,28 @@ SCANNER_HTML = r"""
     updateSelection();
   });
 
-  downloadBtn.addEventListener('click', async () => {
+  async function postDownload(endpoint, filename, extra) {
     if (!fileInput.files.length) return;
     const fd = new FormData();
     fd.append('file', fileInput.files[0]);
-    const res = await fetch('/scan_download', { method: 'POST', body: fd });
+    Object.entries(extra || {}).forEach(([k, v]) => fd.append(k, v));
+    const res = await fetch(endpoint, { method: 'POST', body: fd });
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'bidirectional_rules.csv';
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
-  });
+  }
+  downloadBtn.addEventListener('click', () =>
+    postDownload('/scan_download', `policy_audit_${activeCat}.csv`, { category: activeCat }));
+  downloadAllBtn.addEventListener('click', () =>
+    postDownload('/scan_download', 'policy_audit_all_findings.csv'));
+  document.getElementById('exec-report-btn').addEventListener('click', () =>
+    postDownload('/report_executive', 'executive_report.html'));
+  document.getElementById('eng-report-btn').addEventListener('click', () =>
+    postDownload('/report_engineer', 'engineer_cleanup_plan.html'));
 
   // ── Recommendations ───────────────────────────────────────────
   function closeModal() { recModal.classList.remove('open'); }
@@ -2305,12 +3018,7 @@ def scan_route():
     f = request.files["file"]
     try:
         header, data = parse_policy_csv(f)
-        flagged = scan_bidirectional(header, data)
-        return jsonify({
-            "flagged": flagged,
-            "columns": [label for label, _ in _REPORT_FIELDS],
-            "total_rules": len(data),
-        })
+        return jsonify(audit_policy(header, data))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2354,18 +3062,58 @@ def scan_download_route():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     f = request.files["file"]
+    category = (request.form.get("category") or "").strip() or None
+    if category and category not in {c["key"] for c in AUDIT_CATEGORIES}:
+        return jsonify({"error": f"Unknown category: {category}"}), 400
     try:
         header, data = parse_policy_csv(f)
-        flagged = scan_bidirectional(header, data)
-        csv_data = bidirectional_to_csv(flagged)
+        result = audit_policy(header, data)
+        csv_data = audit_to_csv(result, category_key=category)
         buf = io.BytesIO(csv_data.encode("utf-8"))
         buf.seek(0)
         return send_file(
             buf,
             mimetype="text/csv",
             as_attachment=True,
-            download_name="bidirectional_rules.csv"
+            download_name=(f"policy_audit_{category}.csv" if category
+                           else "policy_audit_all_findings.csv")
         )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _report_response(f, generator, download_name):
+    """Shared parse → audit → HTML-report-download flow for the report routes."""
+    header, data = parse_policy_csv(f)
+    result = audit_policy(header, data)
+    buf = io.BytesIO(generator(result).encode("utf-8"))
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="text/html",
+        as_attachment=True,
+        download_name=download_name
+    )
+
+
+@app.route("/report_executive", methods=["POST"])
+def report_executive_route():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    try:
+        return _report_response(request.files["file"], generate_executive_report,
+                                "executive_report.html")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/report_engineer", methods=["POST"])
+def report_engineer_route():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    try:
+        return _report_response(request.files["file"], generate_engineer_report,
+                                "engineer_cleanup_plan.html")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
