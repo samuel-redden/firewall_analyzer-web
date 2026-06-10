@@ -2,7 +2,6 @@ import os
 import io
 import csv
 import glob
-import json
 import re
 import threading
 import webbrowser
@@ -821,6 +820,7 @@ SEVERITY_POINTS = {"Critical": 6, "High": 4, "Medium": 2, "Low": 1}
 
 # Fixed-position fallbacks for the audited columns (header name still wins).
 DEVICE_COL_INDEX = 3
+POLICY_COL_INDEX = 5
 DISABLED_COL_INDEX = 14
 SERVICE_COL_INDEX = 22
 ACTION_COL_INDEX = 26
@@ -897,10 +897,12 @@ def audit_policy(header, data, today=None):
     last_hit_idx = _col_index(header, "Last Hit", LAST_HIT_COL_INDEX)
     shadow_idx = _col_index(header, "Shadowing Status", SHADOWING_COL_INDEX)
     device_idx = _col_index(header, "Device Name", DEVICE_COL_INDEX)
+    policy_idx = _col_index(header, "Policy Name", POLICY_COL_INDEX)
     fields = [(label, _col_index(header, label, default)) for label, default in _REPORT_FIELDS]
 
     findings = {c["key"]: [] for c in AUDIT_CATEGORIES}
     devices = []
+    policies = []
     rules_with_findings = 0
 
     def flag(key, row, detail):
@@ -919,6 +921,10 @@ def audit_policy(header, data, today=None):
         device = _cell(row, device_idx)
         if device and device not in devices:
             devices.append(device)
+
+        policy = _cell(row, policy_idx)
+        if policy and policy not in policies:
+            policies.append(policy)
 
         # Critical — 'Any' as source, destination, or service on an ALLOW rule.
         # (An Any-Any-Any drop/cleanup rule is normal practice, so deny rules
@@ -1010,6 +1016,7 @@ def audit_policy(header, data, today=None):
         "starting_score": STARTING_SCORE,
         "deductions": deductions,
         "devices": devices,
+        "policies": policies,
         "rules_with_findings": rules_with_findings,
         "columns": AUDIT_REPORT_COLUMNS,
         "categories": categories,
@@ -1744,7 +1751,7 @@ ANALYZER_HTML = r"""
       <h1>Firewall Rule Analyzer</h1>
       <p>// rule minimization &amp; summarization engine</p>
     </div>
-    <a href="/" style="margin-left:auto;font-family:var(--mono);font-size:0.72rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);text-decoration:none;border:1px solid var(--border);padding:8px 14px;transition:all .2s;" onmouseover="this.style.color='var(--accent)';this.style.borderColor='var(--accent)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">&larr; Toolbox</a>
+    <a href="/" style="margin-left:auto;font-family:var(--mono);font-size:0.78rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--bg);background:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:10px 18px;box-shadow:0 0 18px rgba(0,212,255,0.35);transition:all .2s;" onmouseover="this.style.background='#fff';this.style.borderColor='#fff';this.style.boxShadow='0 0 30px rgba(0,212,255,0.5)'" onmouseout="this.style.background='var(--accent)';this.style.borderColor='var(--accent)';this.style.boxShadow='0 0 18px rgba(0,212,255,0.35)'">&larr; Toolbox</a>
   </header>
 
   <!-- Upload card -->
@@ -2035,16 +2042,19 @@ SHARED_CSS = r"""
   .back-link {
     margin-left: auto;
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: 0.78rem;
+    font-weight: 700;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: var(--bg);
+    background: var(--accent);
     text-decoration: none;
-    border: 1px solid var(--border);
-    padding: 8px 14px;
+    border: 1px solid var(--accent);
+    padding: 10px 18px;
+    box-shadow: 0 0 18px rgba(0,212,255,0.35);
     transition: all .2s;
   }
-  .back-link:hover { color: var(--accent); border-color: var(--accent); }
+  .back-link:hover { background: #fff; border-color: #fff; box-shadow: 0 0 30px rgba(0,212,255,0.5); }
   .card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -2295,8 +2305,8 @@ SCANNER_HTML = r"""
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Score dashboard */
-  .score-wrap { display: flex; align-items: center; justify-content: center; gap: 48px; flex-wrap: wrap; margin-bottom: 28px; }
-  .score-main { text-align: center; }
+  .score-wrap { display: flex; align-items: center; justify-content: center; gap: 40px; flex-wrap: nowrap; margin-bottom: 28px; }
+  .score-main { text-align: center; flex-shrink: 0; }
   #gauge { display: block; width: 260px; max-width: 100%; margin: 0 auto; overflow: visible; }
   #gauge text { font-family: var(--mono); font-size: 8px; fill: var(--muted); letter-spacing: 0.05em; }
   #gauge-fill { transition: stroke 0.4s; }
@@ -2314,17 +2324,35 @@ SCANNER_HTML = r"""
     letter-spacing: 0.2em; text-transform: uppercase;
     padding: 4px 14px; border: 1px solid currentColor; margin-top: 10px;
   }
-  .score-side { flex: 0 1 auto; min-width: 260px; }
+  .score-side { flex: 0 1 auto; min-width: 0; }
+  .score-actions { flex-shrink: 0; }
   .score-device {
+    font-family: var(--mono); font-size: 0.7rem;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .score-device b { font-family: var(--sans); font-size: 1.15rem; font-weight: 800; letter-spacing: 0.04em; }
+  .score-policies {
     font-family: var(--mono); font-size: 0.7rem;
     letter-spacing: 0.15em; text-transform: uppercase;
     color: var(--muted); margin-bottom: 16px;
   }
-  .score-device b { font-family: var(--sans); font-size: 1.15rem; font-weight: 800; letter-spacing: 0.04em; }
+  .score-policies span { color: var(--text); text-transform: none; letter-spacing: 0.05em; }
   .score-math { font-family: var(--mono); font-size: 0.78rem; color: var(--text); margin-top: 12px; }
   .score-legend { font-family: var(--mono); font-size: 0.65rem; letter-spacing: 0.08em; color: var(--muted); margin-top: 6px; }
   .score-actions { display: flex; flex-direction: column; gap: 12px; }
   .btn-sm { padding: 11px 18px; font-size: 0.72rem; justify-content: flex-start; }
+  .card-head { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+  .card-head .card-label { margin-bottom: 0; flex: 1; }
+  .new-scan {
+    background: var(--accent); border: 1px solid var(--accent); color: var(--bg);
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    padding: 9px 16px; cursor: pointer; transition: all 0.2s;
+    box-shadow: 0 0 18px rgba(0,212,255,0.35);
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .new-scan:hover { background: #fff; border-color: #fff; box-shadow: 0 0 30px rgba(0,212,255,0.5); }
 
   /* Severity palette */
   .sev-critical { --sev: #ff4757; }
@@ -2437,7 +2465,7 @@ SCANNER_HTML = r"""
     <a class="back-link" href="/">&larr; Toolbox</a>
   </header>
 
-  <div class="card">
+  <div class="card" id="input-card">
     <div class="card-label">01 &mdash; Input</div>
     <div id="dropzone">
       <input type="file" id="file-input" accept=".csv">
@@ -2465,7 +2493,10 @@ SCANNER_HTML = r"""
 
   <div id="results">
     <div class="card">
-      <div class="card-label">02 &mdash; Score Dashboard</div>
+      <div class="card-head">
+        <div class="card-label">02 &mdash; Score Dashboard</div>
+        <button class="new-scan" id="new-scan-btn" title="Run another scan">&larr; New Scan</button>
+      </div>
       <div class="score-wrap">
         <div class="score-main">
           <svg id="gauge" viewBox="0 0 220 134" role="img" aria-label="Policy score gauge">
@@ -2483,6 +2514,7 @@ SCANNER_HTML = r"""
         </div>
         <div class="score-side">
           <div class="score-device" id="score-device" style="display:none;">// device: <b id="device-name"></b></div>
+          <div class="score-policies" id="score-policies" style="display:none;">// policies: <span id="policy-names"></span></div>
           <div class="score-math" id="score-math"></div>
           <div class="score-legend">critical &minus;6 &middot; high &minus;4 &middot; medium &minus;2 &middot; low &minus;1 per finding</div>
         </div>
@@ -2563,6 +2595,7 @@ SCANNER_HTML = r"""
 
 <script>
   const fileInput = document.getElementById('file-input');
+  const inputCard = document.getElementById('input-card');
   const dropzone  = document.getElementById('dropzone');
   const fileNameEl = document.getElementById('file-name');
   const scanBtn   = document.getElementById('scan-btn');
@@ -2577,6 +2610,8 @@ SCANNER_HTML = r"""
   const gaugeNeedleLine = gaugeNeedle.querySelector('line');
   const scoreDevice = document.getElementById('score-device');
   const deviceName = document.getElementById('device-name');
+  const scorePolicies = document.getElementById('score-policies');
+  const policyNames = document.getElementById('policy-names');
   const scoreMath = document.getElementById('score-math');
   const catGrid = document.getElementById('cat-grid');
   const catTitle = document.getElementById('cat-title');
@@ -2638,6 +2673,7 @@ SCANNER_HTML = r"""
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
       renderResults(data);
+      inputCard.style.display = 'none';
       const findings = data.categories.reduce((sum, c) => sum + c.count, 0);
       setStatus('ok', `Done — score ${data.score}/${data.starting_score}, ${findings} finding(s) across ${data.total_rules} rule(s).`);
     } catch (err) {
@@ -2711,6 +2747,13 @@ SCANNER_HTML = r"""
       scoreDevice.style.display = 'none';
     }
 
+    if (data.policies && data.policies.length) {
+      policyNames.textContent = data.policies.join(', ');
+      scorePolicies.style.display = 'block';
+    } else {
+      scorePolicies.style.display = 'none';
+    }
+
     scoreMath.textContent = `${data.starting_score} start − ${data.deductions} deducted · ${data.total_rules} rule(s) scanned`;
 
     const firstWithFindings = data.categories.find(c => c.count > 0);
@@ -2719,7 +2762,7 @@ SCANNER_HTML = r"""
     renderCategory(activeCat);
 
     resultsEl.classList.add('visible');
-    resultsEl.scrollIntoView({ behavior: 'smooth' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
   function renderCatGrid() {
@@ -2730,6 +2773,12 @@ SCANNER_HTML = r"""
         <span class="cat-sev">${c.severity} · −${c.points} each</span>
       </div>`).join('');
   }
+
+  document.getElementById('new-scan-btn').addEventListener('click', () => {
+    resultsEl.classList.remove('visible');
+    inputCard.style.display = '';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
 
   catGrid.addEventListener('click', e => {
     const card = e.target.closest('.cat-card');
