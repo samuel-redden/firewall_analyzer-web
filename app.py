@@ -249,14 +249,18 @@ def compress_services(svc_set, object_group_threshold=6):
       - service_str is the comma-joined list of compressed entries.
     """
     proto_ports = defaultdict(list)
+    # Services without a numeric port (e.g. icmp-echo-request) are kept verbatim.
+    non_numeric = []
     for svc in svc_set:
         parts = svc.split("-", 1)
         if len(parts) != 2:
+            non_numeric.append(svc)
             continue
         proto = parts[0]
         try:
             port = int(parts[1])
         except ValueError:
+            non_numeric.append(svc)
             continue
         proto_ports[proto].append(port)
 
@@ -280,6 +284,9 @@ def compress_services(svc_set, object_group_threshold=6):
                 compressed_entries.append(f"{proto}-{s}")
             else:
                 compressed_entries.append(f"{proto}-{s}-{e}")
+
+    # Append non-numeric services (e.g. ICMP types) after the port-based ones.
+    compressed_entries.extend(sorted(set(non_numeric)))
 
     needs_object_group = len(compressed_entries) > object_group_threshold
 
@@ -313,7 +320,14 @@ def analyze(rows, subnet_map=None):
         src       = r.get("src", "").strip()
         dst       = r.get("dst", "").strip()
         transport = r.get("transport", "tcp").strip().lower()
-        service   = r.get("service", "").strip()
+        # The service column exports as either "service" or "service_id".
+        service   = (r.get("service", "") or r.get("service_id", "")).strip()
+
+        # ICMP often arrives with the type in the service column
+        # (e.g. "echo-request" / "echo-reply") instead of a numeric port.
+        # Force the protocol to icmp so it is not treated as a TCP/UDP port.
+        if service.lower() in ("echo-request", "echo-reply") or transport == "icmp":
+            transport = "icmp"
 
         if not src or not dst or not service:
             continue
@@ -448,6 +462,19 @@ def cp_add_service(svc_token, created):
     if len(parts) < 2:
         return lines, svc_token
     proto = parts[0].lower()
+    if proto == "icmp":
+        # e.g. "icmp-echo-request" / "icmp-echo-reply"
+        icmp_name = svc_token.strip().split("-", 1)[1] if "-" in svc_token else svc_token
+        name = "svc_icmp_" + safe_name(icmp_name)
+        icmp_types = {"echo-request": 8, "echo-reply": 0}
+        if name not in created:
+            created.add(name)
+            t = icmp_types.get(icmp_name.lower())
+            if t is not None:
+                lines.append('mc add service-icmp name "{}" icmp-type {} --format json'.format(name, t))
+            else:
+                lines.append('mc add service-icmp name "{}" --format json'.format(name))
+        return lines, name
     cp_type = "tcp" if proto == "tcp" else "udp"
     if len(parts) == 2:
         port = parts[1]
@@ -1406,7 +1433,7 @@ ANALYZER_HTML = r"""
   .container {
     position: relative;
     z-index: 1;
-    max-width: 1100px;
+    max-width: 1500px;
     margin: 0 auto;
     padding: 40px 24px;
   }
@@ -1665,6 +1692,19 @@ ANALYZER_HTML = r"""
     z-index: 1;
   }
 
+  /* ── Drag-to-resize column handles (thead th is position:sticky, so it
+        anchors the absolutely-positioned handle) ── */
+  .col-resizer {
+    position: absolute;
+    top: 0; right: 0;
+    width: 7px; height: 100%;
+    cursor: col-resize;
+    user-select: none;
+    z-index: 3;
+  }
+  .col-resizer:hover { background: var(--accent); opacity: 0.5; }
+  table.resizing { cursor: col-resize; user-select: none; }
+
   /* Zebra striping for row separation */
   tbody tr:nth-child(odd)  { background: rgba(255,255,255,0.02); }
   tbody tr:nth-child(even) { background: rgba(0,0,0,0.15); }
@@ -1920,7 +1960,38 @@ ANALYZER_HTML = r"""
     });
 
     resultsEl.classList.add('visible');
+    makeColumnsResizable(document.getElementById('rules-table'));
     resultsEl.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  // ── Drag-to-resize table columns ──
+  function makeColumnsResizable(table) {
+    if (!table) return;
+    table.querySelectorAll('thead th').forEach(th => {
+      if (th.querySelector('.col-resizer')) return;   // already wired
+      const handle = document.createElement('span');
+      handle.className = 'col-resizer';
+      th.appendChild(handle);
+      handle.addEventListener('mousedown', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.pageX;
+        const startW = th.offsetWidth;
+        table.classList.add('resizing');
+        const onMove = ev => {
+          const w = Math.max(50, startW + ev.pageX - startX);
+          th.style.width = w + 'px';
+          th.style.minWidth = w + 'px';
+        };
+        const onUp = () => {
+          table.classList.remove('resizing');
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    });
   }
 
   // ── Download helpers ──
@@ -2377,6 +2448,9 @@ SCANNER_HTML = r"""
   .cat-label { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text); margin-top: 4px; display: block; }
   .cat-sev { font-family: var(--mono); font-size: 0.6rem; color: var(--muted); margin-top: 4px; display: block; }
 
+  /* Wider working area for the scanner (overrides SHARED_CSS; home page unchanged) */
+  .container { max-width: 1500px; }
+
   .table-wrap { overflow-x: auto; max-height: 480px; overflow-y: auto; }
   table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.8rem; }
   thead th {
@@ -2391,6 +2465,17 @@ SCANNER_HTML = r"""
     border-bottom: 2px solid var(--accent);
     z-index: 1;
   }
+  /* Drag-to-resize column handles (thead th is sticky → anchors the handle) */
+  .col-resizer {
+    position: absolute;
+    top: 0; right: 0;
+    width: 7px; height: 100%;
+    cursor: col-resize;
+    user-select: none;
+    z-index: 3;
+  }
+  .col-resizer:hover { background: var(--accent); opacity: 0.5; }
+  table.resizing { cursor: col-resize; user-select: none; }
   tbody tr:nth-child(odd)  { background: rgba(255,255,255,0.02); }
   tbody tr:nth-child(even) { background: rgba(0,0,0,0.15); }
   tbody tr { border-bottom: 1px solid rgba(0,212,255,0.08); transition: background 0.15s; }
@@ -2432,7 +2517,7 @@ SCANNER_HTML = r"""
     background: var(--panel);
     border: 1px solid var(--accent);
     box-shadow: 0 0 50px rgba(0,212,255,0.18);
-    max-width: 1040px; width: 100%;
+    max-width: 1400px; width: 100%;
     padding: 28px 28px 24px;
     position: relative;
   }
@@ -2660,6 +2745,36 @@ SCANNER_HTML = r"""
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // ── Drag-to-resize table columns ──
+  function makeColumnsResizable(table) {
+    if (!table) return;
+    table.querySelectorAll('thead th').forEach(th => {
+      if (th.querySelector('.col-resizer')) return;   // already wired
+      const handle = document.createElement('span');
+      handle.className = 'col-resizer';
+      th.appendChild(handle);
+      handle.addEventListener('mousedown', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.pageX;
+        const startW = th.offsetWidth;
+        table.classList.add('resizing');
+        const onMove = ev => {
+          const w = Math.max(50, startW + ev.pageX - startX);
+          th.style.width = w + 'px';
+          th.style.minWidth = w + 'px';
+        };
+        const onUp = () => {
+          table.classList.remove('resizing');
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    });
+  }
+
   scanBtn.addEventListener('click', async () => {
     if (!fileInput.files.length) return;
     setStatus('active', 'Uploading and scanning policy…');
@@ -2816,6 +2931,7 @@ SCANNER_HTML = r"""
     });
     html += '</tbody></table></div>';
     reportArea.innerHTML = html;
+    makeColumnsResizable(reportArea.querySelector('table'));
     downloadBtn.style.display = 'inline-flex';
     downloadActions.style.display = 'flex';
     if (isBidir) updateSelection();
@@ -2916,6 +3032,7 @@ SCANNER_HTML = r"""
     });
     html += '</tbody></table></div>';
     recArea.innerHTML = html;
+    makeColumnsResizable(recArea.querySelector('table'));
     recActions.style.display = 'flex';
   }
 

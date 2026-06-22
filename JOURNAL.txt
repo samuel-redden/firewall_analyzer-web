@@ -1,0 +1,35 @@
+PROJECT JOURNAL — Firewall Rule Analyzer
+========================================
+
+2026-06-22 — Analyzer: service_id column + ICMP echo-request/echo-reply
+  Prompt: Analyzer service column may export as "service" OR "service_id";
+  also handle ICMP expressed as "echo-request"/"echo-reply".
+  Outcome (app.py):
+    - analyze(): service now read from "service" falling back to "service_id".
+    - analyze(): if service is echo-request/echo-reply (or transport=icmp),
+      force transport to "icmp" so it isn't treated as a TCP/UDP port.
+    - compress_services(): non-numeric services (e.g. icmp-echo-request) are
+      preserved verbatim instead of being silently dropped.
+    - cp_add_service(): emits Check Point "add service-icmp" objects with the
+      right icmp-type (echo-request=8, echo-reply=0).
+  Verified with an inline test (service_id + both ICMP forms) — analyze output
+  and generated mgmt_cli script both correct.
+
+2026-06-22 — Wider, resizable result tables (both apps)
+  Prompt: make the web output tables wider and allow dragging column widths.
+  Outcome (app.py, embedded templates):
+    - Widened working area: analyzer .container 1100->1500px; scanner adds a
+      .container override to 1500px (home page left untouched); recommendations
+      modal 1040->1400px.
+    - Added drag-to-resize columns: .col-resizer CSS + makeColumnsResizable(table)
+      JS in both ANALYZER_HTML and SCANNER_HTML. Each <th> gets a right-edge
+      grab handle (col-resize cursor); mousedown/move sets th width/min-width.
+      Wired into analyzer renderResults(), scanner showCategory() and
+      renderRecommendations(). Idempotent (skips if handle already present).
+  Verified app.py imports clean.
+
+CURRENT STATE
+  Done: analyzer handles service/service_id and ICMP echo-request/echo-reply
+        (analysis + Check Point script). Result tables in both apps are wider
+        and support drag-to-resize columns.
+  Next: none outstanding.
