@@ -28,8 +28,36 @@ PROJECT JOURNAL — Firewall Rule Analyzer
       renderRecommendations(). Idempotent (skips if handle already present).
   Verified app.py imports clean.
 
+2026-06-23 — Analyzer: rule-vs-existing-policy coverage check
+  Prompt: also let the analyzer take the existing policy (same format as
+  sample_policy.csv) and tell me if I just need to add something to an
+  existing rule instead of creating a new one.
+  Outcome (app.py):
+    - New engine section "RULE-vs-POLICY COVERAGE MATCH": match_rules_to_policy()
+      cross-references each analyze() rule against the existing policy's
+      ENABLED ALLOW rules. Path (src->dst) matching is IP-aware via
+      _object_network() + subnet containment; 'Any' covers all. Service
+      objects are named/opaque, so service coverage is best-effort
+      (_policy_service_state): Any/ALL_* and a literal port-number hit = "ok",
+      else "unknown" -> "verify/add". Per rule status: covered / amend / new.
+      coverage_to_csv() exports the report.
+    - /analyze now accepts an OPTIONAL second file field "policy"; when present
+      it adds {coverage, summary} to the JSON (backward compatible without it).
+      New /coverage_download endpoint returns policy_coverage.csv.
+    - ANALYZER_HTML: optional policy dropzone in the Input card; new
+      "03 - Policy Coverage" card (hidden until coverage returned) with status
+      pills (covered/amend/new), summary stats, and CSV download. escapeHtml()
+      used for the policy-derived cells.
+  Verified: ast parse OK; engine unit test (synthetic policy) hits all of
+  covered/amend/new and ignores disabled rules; Flask test-client confirms
+  /analyze with+without policy and /coverage_download.
+
 CURRENT STATE
   Done: analyzer handles service/service_id and ICMP echo-request/echo-reply
         (analysis + Check Point script). Result tables in both apps are wider
-        and support drag-to-resize columns.
-  Next: none outstanding.
+        and support drag-to-resize columns. Analyzer can now take an existing
+        policy export and flag each generated rule as already-covered,
+        amend-an-existing-rule, or new.
+  Next: service coverage is textual only (named service objects can't be
+        resolved to ports) — a future service-object dictionary could make
+        "covered vs amend" exact.

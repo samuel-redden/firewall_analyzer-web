@@ -1068,6 +1068,215 @@ def audit_to_csv(result, category_key=None):
 
 
 # ─────────────────────────────────────────────
+#  RULE-vs-POLICY COVERAGE MATCH
+# ─────────────────────────────────────────────
+#
+# Cross-reference the least-permissive rules produced by analyze() against an
+# existing SecureTrack-style policy export so the engineer can tell, per new
+# rule, whether they need a brand-new rule or can simply amend an existing one.
+#
+# Path (Source -> Destination) matching is IP-aware: the network embedded in a
+# policy object name (e.g. 'HCA-10.0.0.0m8' -> 10.0.0.0/8) is compared by
+# subnet containment, and an 'Any' object covers everything. Only *enabled*
+# *ALLOW* rules can permit traffic, so deny/disabled rules are ignored.
+#
+# Service objects are named (e.g. 'Allscripts_Citrix_ICA') and cannot be
+# resolved to ports without a service-object dictionary, so service coverage is
+# best-effort: 'Any'/'ALL_*' broad objects and a literal port-number hit count
+# as confirmed; anything else is reported as "verify/add" rather than claimed.
+
+COVERAGE_REPORT_COLUMNS = [
+    "Source", "Destination", "Service", "Status", "Recommendation",
+    "Matched Rule", "Matched Policy", "Existing Source",
+    "Existing Destination", "Existing Service",
+]
+
+
+def _net_of(addr):
+    """Parse a generated rule address (bare IP or CIDR) into an ip_network."""
+    if not addr:
+        return None
+    try:
+        return ipaddress.ip_network(addr.strip(), strict=False)
+    except ValueError:
+        return None
+
+
+def _policy_addr_set(cell):
+    """(has_any, [networks]) for a policy Source/Destination cell."""
+    objs = _split_objects(cell)
+    has_any = any(o.lower() in ("any", "*") for o in objs)
+    nets = [n for n in (_object_network(o) for o in objs) if n is not None]
+    return has_any, nets
+
+
+def _net_covered(gen_net, has_any, nets):
+    """True when gen_net is permitted by a policy side (Any, or a supernet)."""
+    if has_any:
+        return True
+    if gen_net is None:
+        return False
+    for n in nets:
+        try:
+            if gen_net.version == n.version and gen_net.subnet_of(n):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _parse_gen_services(svc_str):
+    """Split a generated service string ('tcp-443, tcp-80-82') into
+    (proto, low, high) tuples. Ports stay as strings for textual matching."""
+    out = []
+    for tok in (svc_str or "").split(","):
+        parts = tok.strip().lower().split("-")
+        if len(parts) == 2:
+            out.append((parts[0], parts[1], parts[1]))
+        elif len(parts) == 3:
+            out.append((parts[0], parts[1], parts[2]))
+    return out
+
+
+def _policy_service_state(gen_services, svc_cell):
+    """Best-effort service coverage: 'ok' (confirmed) or 'unknown' (verify/add)."""
+    objs = _split_objects(svc_cell)
+    if any(o.lower() in ("any", "*") for o in objs):
+        return "ok"
+    if any(_ALL_SERVICE_RE.search(o) for o in objs):
+        return "ok"
+    if not gen_services:
+        return "unknown"
+    text = svc_cell.lower()
+    for _proto, lo, hi in gen_services:
+        found = re.search(r"(?<!\d)" + re.escape(lo) + r"(?!\d)", text) is not None
+        if lo != hi:
+            found = found and re.search(r"(?<!\d)" + re.escape(hi) + r"(?!\d)", text) is not None
+        if not found:
+            return "unknown"   # at least one service can't be confirmed present
+    return "ok"
+
+
+def _policy_rule_label(p):
+    return p["name"] or p["id"] or "(unnamed)"
+
+
+def _match_one_rule(rule, policy_rules):
+    """Classify a single generated rule against the parsed ALLOW policy rules."""
+    gen_dst = _net_of(rule.get("destination", ""))
+    gen_srcs = [(s, _net_of(s)) for s in (rule.get("sources") or [rule.get("source", "")])]
+    gen_services = _parse_gen_services(rule.get("service", ""))
+    svc_display = rule.get("service", "")
+
+    # Best match = covers the destination plus the most sources, tie-broken by
+    # whether the service is also confirmed present.
+    best = None
+    for p in policy_rules:
+        if not _net_covered(gen_dst, p["d_any"], p["d_nets"]):
+            continue
+        covered = [s for (s, n) in gen_srcs if _net_covered(n, p["s_any"], p["s_nets"])]
+        if not covered:
+            continue
+        svc_state = _policy_service_state(gen_services, p["svc_cell"])
+        score = (len(covered), 1 if svc_state == "ok" else 0)
+        if best is None or score > best[0]:
+            best = (score, p, covered, svc_state)
+
+    if best is None:
+        return {
+            "status": "new",
+            "summary": "No existing ALLOW rule permits this path — add a new rule.",
+            "rule_id": "", "rule_name": "", "policy": "",
+            "match_source": "", "match_dest": "", "match_service": "",
+        }
+
+    _score, p, covered, svc_state = best
+    missing = [s for (s, _n) in gen_srcs if s not in covered]
+    label = _policy_rule_label(p)
+
+    if not missing and svc_state == "ok":
+        status = "covered"
+        summary = f"Already permitted by rule {label} — no change needed."
+    elif not missing:
+        status = "amend"
+        summary = f"Path allowed by rule {label}; verify/add service {svc_display} on it."
+    else:
+        status = "amend"
+        bits = ["add source(s) " + ", ".join(missing)]
+        if svc_state != "ok":
+            bits.append(f"service {svc_display}")
+        summary = f"Rule {label} covers part of this — " + " and ".join(bits) + "."
+
+    return {
+        "status": status,
+        "summary": summary,
+        "rule_id": p["id"], "rule_name": p["name"], "policy": p["policy"],
+        "match_source": p["src_cell"], "match_dest": p["dst_cell"],
+        "match_service": p["svc_cell"],
+    }
+
+
+def match_rules_to_policy(rules, header, data):
+    """Return a coverage dict aligned 1:1 with `rules`, plus summary counts."""
+    src_idx = _col_index(header, "Source", SRC_COL_INDEX)
+    dst_idx = _col_index(header, "Destination", DST_COL_INDEX)
+    svc_idx = _col_index(header, "Service", SERVICE_COL_INDEX)
+    action_idx = _col_index(header, "Action", ACTION_COL_INDEX)
+    disabled_idx = _col_index(header, "Disabled", DISABLED_COL_INDEX)
+    seq_idx = _col_index(header, "Seq No.", 0)
+    name_idx = _col_index(header, "Rule Name", 13)
+    policy_idx = _col_index(header, "Policy Name", POLICY_COL_INDEX)
+
+    # Pre-parse the enabled ALLOW rules once.
+    policy_rules = []
+    for row in data:
+        if not _is_allow(_cell(row, action_idx)):
+            continue
+        if _cell(row, disabled_idx).lower() in ("true", "yes", "1", "disabled"):
+            continue
+        src_cell = _cell(row, src_idx)
+        dst_cell = _cell(row, dst_idx)
+        svc_cell = _cell(row, svc_idx)
+        s_any, s_nets = _policy_addr_set(src_cell)
+        d_any, d_nets = _policy_addr_set(dst_cell)
+        policy_rules.append({
+            "id": _cell(row, seq_idx), "name": _cell(row, name_idx),
+            "policy": _cell(row, policy_idx),
+            "src_cell": src_cell, "dst_cell": dst_cell, "svc_cell": svc_cell,
+            "s_any": s_any, "s_nets": s_nets, "d_any": d_any, "d_nets": d_nets,
+        })
+
+    coverage = [_match_one_rule(r, policy_rules) for r in rules]
+    summary = {"covered": 0, "amend": 0, "new": 0}
+    for c in coverage:
+        summary[c["status"]] = summary.get(c["status"], 0) + 1
+    summary["policy_rules"] = len(policy_rules)
+    return {"coverage": coverage, "summary": summary}
+
+
+def coverage_to_csv(rules, coverage):
+    """Export the rule-vs-policy coverage analysis as CSV."""
+    status_label = {"covered": "Covered", "amend": "Amend existing", "new": "New rule"}
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(COVERAGE_REPORT_COLUMNS)
+    for r, c in zip(rules, coverage):
+        writer.writerow([
+            r.get("source_display", r.get("source", "")),
+            r.get("destination_display", r.get("destination", "")),
+            r.get("service", ""),
+            status_label.get(c["status"], c["status"]),
+            c["summary"],
+            c.get("rule_name") or c.get("rule_id") or "",
+            c.get("policy", ""),
+            c.get("match_source", ""),
+            c.get("match_dest", ""),
+            c.get("match_service", ""),
+        ])
+    return output.getvalue()
+
+
+# ─────────────────────────────────────────────
 #  AUDIT REPORTS (EXECUTIVE / ENGINEER)
 # ─────────────────────────────────────────────
 #
@@ -1517,7 +1726,7 @@ ANALYZER_HTML = r"""
   }
 
   /* ── Drop zone ── */
-  #dropzone {
+  #dropzone, #dropzone-policy {
     border: 1px dashed var(--border);
     padding: 52px 32px;
     text-align: center;
@@ -1525,17 +1734,26 @@ ANALYZER_HTML = r"""
     transition: all 0.2s;
     position: relative;
   }
-  #dropzone:hover, #dropzone.drag-over {
+  #dropzone-policy { padding: 32px; }
+  #dropzone:hover, #dropzone.drag-over,
+  #dropzone-policy:hover, #dropzone-policy.drag-over {
     border-color: var(--accent);
     background: rgba(0,212,255,0.04);
   }
-  #dropzone input[type=file] {
+  #dropzone input[type=file], #dropzone-policy input[type=file] {
     position: absolute;
     inset: 0;
     opacity: 0;
     cursor: pointer;
     width: 100%;
     height: 100%;
+  }
+  #policy-file-name {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--success);
+    margin-top: 12px;
+    min-height: 1.2em;
   }
   .drop-icon {
     font-size: 2.5rem;
@@ -1774,6 +1992,28 @@ ANALYZER_HTML = r"""
 
   #results { display: none; }
   #results.visible { display: block; }
+
+  #coverage { display: none; }
+  #coverage.visible { display: block; }
+
+  /* ── Coverage status pills ── */
+  .cov-pill {
+    display: inline-block;
+    padding: 3px 10px;
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    border: 1px solid;
+  }
+  .cov-covered { background: rgba(0,255,157,0.12); color: var(--success); border-color: rgba(0,255,157,0.4); }
+  .cov-amend   { background: rgba(255,107,53,0.12); color: var(--accent2); border-color: rgba(255,107,53,0.4); }
+  .cov-new     { background: rgba(255,77,90,0.12); color: #ff6066; border-color: rgba(255,77,90,0.45); }
+  tbody tr.cov-row-covered td:nth-child(1) { border-left: 3px solid var(--success); padding-left: 13px; }
+  tbody tr.cov-row-amend   td:nth-child(1) { border-left: 3px solid var(--accent2); padding-left: 13px; }
+  tbody tr.cov-row-new     td:nth-child(1) { border-left: 3px solid #ff4d5a; padding-left: 13px; }
+  #coverage-table tbody td:nth-child(5) { color: var(--text); font-family: var(--sans); white-space: normal; }
 </style>
 </head>
 <body>
@@ -1801,10 +2041,18 @@ ANALYZER_HTML = r"""
     <div id="dropzone">
       <input type="file" id="file-input" accept=".csv">
       <div class="drop-icon">📂</div>
-      <div class="drop-title">Drop your CSV file here</div>
+      <div class="drop-title">Drop your traffic CSV file here</div>
       <div class="drop-sub">or click to browse &nbsp;·&nbsp; columns: src, dst, transport, action, service, count</div>
     </div>
     <div id="file-name"></div>
+
+    <div id="dropzone-policy" style="margin-top:18px;">
+      <input type="file" id="policy-input" accept=".csv">
+      <div class="drop-icon" style="font-size:2rem;">📑</div>
+      <div class="drop-title">Existing policy CSV <span style="color:var(--muted);font-weight:400;">(optional)</span></div>
+      <div class="drop-sub">drop a SecureTrack policy export to check what's already covered &nbsp;·&nbsp; same format as sample_policy.csv</div>
+    </div>
+    <div id="policy-file-name"></div>
 
     <div class="actions">
       <button class="btn btn-primary" id="analyze-btn" disabled>
@@ -1861,6 +2109,43 @@ ANALYZER_HTML = r"""
     </div>
   </div>
 
+  <!-- Policy coverage card -->
+  <div id="coverage" class="card">
+    <div class="card-label">03 &mdash; Policy Coverage</div>
+    <p style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+      Each generated rule checked against your existing <strong style="color:var(--text);">enabled ALLOW</strong> rules.
+      Path (src&rarr;dst) matching is IP-aware; service objects are named, so service coverage is best-effort &mdash; "amend" rows list what to verify or add.
+    </p>
+
+    <div class="stats-row" id="coverage-stats"></div>
+
+    <div class="table-wrap">
+      <table id="coverage-table">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Destination</th>
+            <th>Service</th>
+            <th>Status</th>
+            <th>Recommendation</th>
+          </tr>
+        </thead>
+        <tbody id="coverage-tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-secondary" id="download-coverage-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Download Coverage Report (CSV)
+      </button>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1876,6 +2161,13 @@ ANALYZER_HTML = r"""
   const rulesBody     = document.getElementById('rules-tbody');
   const downloadBtn   = document.getElementById('download-btn');
   const downloadCpBtn = document.getElementById('download-cp-btn');
+  const policyInput   = document.getElementById('policy-input');
+  const policyZone    = document.getElementById('dropzone-policy');
+  const policyNameEl  = document.getElementById('policy-file-name');
+  const coverageEl    = document.getElementById('coverage');
+  const coverageStats = document.getElementById('coverage-stats');
+  const coverageBody  = document.getElementById('coverage-tbody');
+  const downloadCovBtn = document.getElementById('download-coverage-btn');
 
   let lastRules = [];
 
@@ -1889,6 +2181,16 @@ ANALYZER_HTML = r"""
   });
   fileInput.addEventListener('change', updateFile);
 
+  // ── Optional policy file Drag & Drop ──
+  policyZone.addEventListener('dragover', e => { e.preventDefault(); policyZone.classList.add('drag-over'); });
+  policyZone.addEventListener('dragleave', () => policyZone.classList.remove('drag-over'));
+  policyZone.addEventListener('drop', e => {
+    e.preventDefault();
+    policyZone.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) { policyInput.files = e.dataTransfer.files; updatePolicyFile(); }
+  });
+  policyInput.addEventListener('change', updatePolicyFile);
+
   function updateFile() {
     if (fileInput.files.length) {
       fileNameEl.textContent = '✓ ' + fileInput.files[0].name;
@@ -1896,9 +2198,14 @@ ANALYZER_HTML = r"""
     }
   }
 
+  function updatePolicyFile() {
+    policyNameEl.textContent = policyInput.files.length ? '✓ ' + policyInput.files[0].name : '';
+  }
+
   function buildFormData() {
     const fd = new FormData();
     fd.append('file', fileInput.files[0]);
+    if (policyInput.files.length) fd.append('policy', policyInput.files[0]);
     return fd;
   }
 
@@ -1961,7 +2268,48 @@ ANALYZER_HTML = r"""
 
     resultsEl.classList.add('visible');
     makeColumnsResizable(document.getElementById('rules-table'));
+    renderCoverage(data);
     resultsEl.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  function renderCoverage(data) {
+    const cov = data.coverage;
+    if (!cov || !cov.length) { coverageEl.classList.remove('visible'); return; }
+
+    const s = data.summary || {};
+    coverageStats.innerHTML = `
+      <div class="stat"><span class="stat-value" style="color:var(--success)">${s.covered || 0}</span><span class="stat-label">Already Covered</span></div>
+      <div class="stat"><span class="stat-value" style="color:var(--accent2)">${s.amend || 0}</span><span class="stat-label">Amend Existing</span></div>
+      <div class="stat"><span class="stat-value" style="color:#ff6066">${s.new || 0}</span><span class="stat-label">New Rule Needed</span></div>
+      <div class="stat"><span class="stat-value">${s.policy_rules || 0}</span><span class="stat-label">Policy ALLOW Rules</span></div>
+    `;
+
+    const pill = { covered: 'Covered', amend: 'Amend', new: 'New Rule' };
+    coverageBody.innerHTML = '';
+    data.rules.forEach((r, idx) => {
+      const c = cov[idx];
+      const rowNum = String(idx + 1).padStart(2, '0');
+      const srcLabel = r.source_display || r.source;
+      const dstLabel = r.destination_display || r.destination;
+      const tr = document.createElement('tr');
+      tr.classList.add('cov-row-' + c.status);
+      tr.innerHTML = `
+        <td data-row="${rowNum}">${escapeHtml(srcLabel)}</td>
+        <td>${escapeHtml(dstLabel)}</td>
+        <td>${escapeHtml(r.service)}</td>
+        <td><span class="cov-pill cov-${c.status}">${pill[c.status] || c.status}</span></td>
+        <td>${escapeHtml(c.summary)}</td>
+      `;
+      coverageBody.appendChild(tr);
+    });
+
+    coverageEl.classList.add('visible');
+    makeColumnsResizable(document.getElementById('coverage-table'));
   }
 
   // ── Drag-to-resize table columns ──
@@ -2009,6 +2357,7 @@ ANALYZER_HTML = r"""
 
   downloadBtn.addEventListener('click', () => triggerDownload('/download', 'firewall_rules.csv'));
   downloadCpBtn.addEventListener('click', () => triggerDownload('/download_checkpoint', 'checkpoint_build.sh'));
+  downloadCovBtn.addEventListener('click', () => triggerDownload('/coverage_download', 'policy_coverage.csv'));
 </script>
 </body>
 </html>
@@ -3121,12 +3470,19 @@ def analyze_route():
         total_rows = len(rows)
         filtered = filter_rows(rows)
         rules = analyze(filtered, subnet_map=subnet_map)
-        return jsonify({
+        response = {
             "rules": rules,
             "total_rows": total_rows,
             "filtered_rows": len(filtered),
             "subnet_entries": len(subnet_map)
-        })
+        }
+        # Optional: cross-reference against an existing policy export so the
+        # user can see which flows just need an existing rule amended.
+        policy_file = request.files.get("policy")
+        if policy_file and policy_file.filename:
+            header, data = parse_policy_csv(policy_file)
+            response.update(match_rules_to_policy(rules, header, data))
+        return jsonify(response)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3172,6 +3528,34 @@ def download_checkpoint_route():
             mimetype="text/plain",
             as_attachment=True,
             download_name="checkpoint_build.sh"
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/coverage_download", methods=["POST"])
+def coverage_download_route():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    policy_file = request.files.get("policy")
+    if not (policy_file and policy_file.filename):
+        return jsonify({"error": "No policy file uploaded"}), 400
+    f = request.files["file"]
+    try:
+        subnet_map = _load_subnet_map()
+        rows = parse_csv(f)
+        filtered = filter_rows(rows)
+        rules = analyze(filtered, subnet_map=subnet_map)
+        header, data = parse_policy_csv(policy_file)
+        result = match_rules_to_policy(rules, header, data)
+        csv_data = coverage_to_csv(rules, result["coverage"])
+        buf = io.BytesIO(csv_data.encode("utf-8"))
+        buf.seek(0)
+        return send_file(
+            buf,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="policy_coverage.csv"
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
