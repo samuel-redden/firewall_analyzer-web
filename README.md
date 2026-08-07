@@ -88,15 +88,27 @@ observed traffic.
 | `service` | Port number |
 | `count` | Number of hits for this flow |
 
+## Output Detail
+
+Pick how much the generated rules are consolidated before you hit **Analyze**.
+The choice applies to the on-screen table and to both downloads.
+
+- **Consolidated** (default) — summarizes sources into named or /24 subnets,
+  compresses ports into ranges, and merges rules that share a destination and
+  service. Fewest rules.
+- **Specific** — exact source and destination addresses, every port listed on
+  its own, and one rule per source→destination pair. Most rules, but nothing
+  is widened beyond the traffic that was actually observed.
+
 ## Rule Design Logic
 
 - **Minimum hits:** Flows with `count < 2` are excluded (noise filtering)
-- **Subnet summarization:** If ≥50% of IPs in a /24 subnet appear (or ≥10
-  distinct IPs), the rule uses the subnet (e.g., `10.0.68.0/24`) instead of
-  individual IPs
-- **Port compression:** Consecutive ports collapse into ranges
-  (`tcp-80-82`); rules needing 6+ service objects are flagged for an
-  object group
+- **Subnet summarization** *(Consolidated only)*: If ≥50% of IPs in a /24
+  subnet appear (or ≥10 distinct IPs), the rule uses the subnet
+  (e.g., `10.0.68.0/24`) instead of individual IPs
+- **Port compression** *(Consolidated only)*: Consecutive ports collapse into
+  ranges (`tcp-80-82`). In either mode, rules needing 6+ service objects are
+  flagged for an object group
 - **Least permissive:** Rules are scoped to exact destination IPs and specific
   ports/protocols
 - **Output format:** `Source, Destination, Service`
@@ -125,7 +137,7 @@ floors at 0).
 | Check | Severity | Deduction |
 |-------|----------|-----------|
 | `Any` as source, destination, or service (ALLOW rules only) | Critical | −6 |
-| Overly permissive ALLOW rule (network /16 or wider, broad service such as `ALL_*` or a >1000-port range, or >10 objects in one field) | High | −4 |
+| Overly permissive **enabled** ALLOW rule (network /16 or wider, broad service such as `ALL_*` or a >1000-port range, or >50 objects in one field) | High | −4 |
 | Bi-directional (Source == Destination) | Medium | −2 |
 | Missing logging (`Logged` column not true) | Medium | −2 |
 | Missing comment | Low | −1 |
@@ -151,7 +163,7 @@ floors at 0).
   recommended next steps
 - **Engineer Cleanup Plan** — a self-contained HTML runbook: prioritized
   remediation phases with step-by-step guidance and the affected rules per
-  phase
+  phase. Its rule tables are wide, so it is set to print **landscape**
 
 ## Bi-Directional Split Recommendations
 
@@ -167,4 +179,5 @@ Stage one or more `all_networks*.csv` files (header: `CIDR,NAME`) next to
 `app.py` (or the `.exe`). The Rule Analyzer uses the names for display labels
 and Check Point object names; the longest-prefix match wins, and named subnets
 take priority over automatic /24 aggregation. The files are read from disk on
-each request — no upload needed.
+each request — no upload needed. The map is only applied in **Consolidated**
+output mode; **Specific** mode deliberately keeps the raw addresses.

@@ -17,6 +17,13 @@ app = Flask(__name__)
 #  FIREWALL RULE ANALYSIS ENGINE
 # ─────────────────────────────────────────────
 
+# How much the generated rules are consolidated. See analyze() for what each
+# mode does; the UI exposes both and passes the choice through as a form field.
+SUMMARIZE_MODE = "summarize"
+SPECIFIC_MODE = "specific"
+ANALYSIS_MODES = (SUMMARIZE_MODE, SPECIFIC_MODE)
+
+
 def parse_csv(file_stream):
     """Parse the uploaded CSV, return list of dicts."""
     content = file_stream.read().decode("utf-8-sig")
@@ -228,13 +235,25 @@ def summarize_ips(ip_list, threshold=0.50, min_count=10, subnet_map=None):
     return sorted(set(result))
 
 
+def _addr_sort_key(addr):
+    """
+    Sort key that orders addresses numerically (10.5.9.2 before 10.5.9.10)
+    instead of lexically. Non-IP values (hostnames) sort last, alphabetically.
+    """
+    try:
+        net = ipaddress.ip_network(addr, strict=False)
+        return (0, net.version, int(net.network_address), net.prefixlen, "")
+    except ValueError:
+        return (1, 0, 0, 0, addr.lower())
+
+
 def build_service_string(transport, port):
     """Format service as tcp-PORT or udp-PORT."""
     proto = transport.strip().lower()
     return f"{proto}-{port.strip()}"
 
 
-def compress_services(svc_set, object_group_threshold=6):
+def compress_services(svc_set, object_group_threshold=6, compress_ranges=True):
     """
     Given a set of service strings like {'tcp-80', 'tcp-81', 'tcp-82', 'udp-53'},
     return a tuple (service_str, needs_object_group).
@@ -242,7 +261,8 @@ def compress_services(svc_set, object_group_threshold=6):
     Rules:
       - Group by protocol.
       - Within each protocol, collapse consecutive port numbers into ranges
-        e.g. tcp-80, tcp-81, tcp-82 -> tcp-80-82
+        e.g. tcp-80, tcp-81, tcp-82 -> tcp-80-82. In "specific" output mode
+        (compress_ranges=False) every port is listed on its own instead.
       - Count resulting entries (individual ports + ranges each count as 1).
       - If total entries across all protocols > object_group_threshold,
         set needs_object_group = True.
@@ -268,16 +288,19 @@ def compress_services(svc_set, object_group_threshold=6):
 
     for proto in sorted(proto_ports.keys()):
         ports = sorted(set(proto_ports[proto]))
-        ranges = []
-        start = ports[0]
-        end   = ports[0]
-        for p in ports[1:]:
-            if p == end + 1:
-                end = p
-            else:
-                ranges.append((start, end))
-                start = end = p
-        ranges.append((start, end))
+        if compress_ranges:
+            ranges = []
+            start = ports[0]
+            end   = ports[0]
+            for p in ports[1:]:
+                if p == end + 1:
+                    end = p
+                else:
+                    ranges.append((start, end))
+                    start = end = p
+            ranges.append((start, end))
+        else:
+            ranges = [(p, p) for p in ports]
 
         for (s, e) in ranges:
             if s == e:
@@ -293,15 +316,25 @@ def compress_services(svc_set, object_group_threshold=6):
     return ", ".join(compressed_entries), needs_object_group
 
 
-def analyze(rows, subnet_map=None):
+def analyze(rows, subnet_map=None, mode=SUMMARIZE_MODE):
     """
     Core analysis:
       1. Collect all (transport, port) pairs per (src_set, dst).
       2. Summarize src IPs into named subnets (subnet_map) or /24 subnets where >50% present.
       3. Merge all services for the same (summarized_src, dst) into one rule.
     Returns list of rule dicts: {source, destination, service}
+
+    `mode` controls how aggressively the output is consolidated:
+      SUMMARIZE_MODE — full consolidation (steps 2 and 3 above, plus port-range
+                       compression and grouping of rules that share a
+                       destination + service).
+      SPECIFIC_MODE  — minimal consolidation: exact source and destination
+                       addresses, every port listed individually, and one rule
+                       per source → destination pair. Only the deduplication of
+                       identical flows is kept.
     """
     subnet_map = subnet_map or []
+    specific = (mode == SPECIFIC_MODE)
 
     # Pass 1 — collect src IPs and services per dst
     # key = dst  →  {src: set of (transport, port)}
@@ -310,7 +343,7 @@ def analyze(rows, subnet_map=None):
     def resolve_addr(addr_str):
         """Collapse addr to its named subnet CIDR if it matches, otherwise return as-is."""
         obj = normalize_ip(addr_str)
-        if obj and subnet_map:
+        if obj and subnet_map and not specific:
             match = match_named_subnet(obj, subnet_map)
             if match:
                 return str(match[0])
@@ -340,24 +373,28 @@ def analyze(rows, subnet_map=None):
 
     for dst, src_map in dst_src_services.items():
         all_srcs = list(src_map.keys())
-        summarized = summarize_ips(all_srcs, subnet_map=subnet_map)
 
-        # Build a reverse map: original_ip → summarized_entry
+        # Build a reverse map: original_ip → summarized_entry.
+        # Specific mode keeps every source address exactly as it arrived.
         ip_to_summary = {}
-        for orig in all_srcs:
-            obj = normalize_ip(orig)
-            if obj:
-                # Named subnet takes priority
-                if subnet_map:
-                    match = match_named_subnet(obj, subnet_map)
-                    if match:
-                        ip_to_summary[orig] = str(match[0])
-                        continue
-                # Fall back to /24 collapse check
-                net_str = str(subnet_key(obj))
-                ip_to_summary[orig] = net_str if net_str in summarized else orig
-            else:
-                ip_to_summary[orig] = orig
+        if specific:
+            ip_to_summary = {orig: orig for orig in all_srcs}
+        else:
+            summarized = summarize_ips(all_srcs, subnet_map=subnet_map)
+            for orig in all_srcs:
+                obj = normalize_ip(orig)
+                if obj:
+                    # Named subnet takes priority
+                    if subnet_map:
+                        match = match_named_subnet(obj, subnet_map)
+                        if match:
+                            ip_to_summary[orig] = str(match[0])
+                            continue
+                    # Fall back to /24 collapse check
+                    net_str = str(subnet_key(obj))
+                    ip_to_summary[orig] = net_str if net_str in summarized else orig
+                else:
+                    ip_to_summary[orig] = orig
 
         # Accumulate services under the summarized source key
         for orig_src, svcs in src_map.items():
@@ -376,7 +413,7 @@ def analyze(rows, subnet_map=None):
     # Pass 3 — build per-(src, dst) rules with compressed services
     raw_rules = []
     for (src, dst), svcs in merged.items():
-        service_str, needs_og = compress_services(svcs)
+        service_str, needs_og = compress_services(svcs, compress_ranges=not specific)
         raw_rules.append({
             "source":              src,
             "destination":         dst,
@@ -386,14 +423,19 @@ def analyze(rows, subnet_map=None):
             "object_group":        needs_og
         })
 
-    # Pass 4 — group rules that share the same destination + service into one rule
+    # Pass 4 — group rules that share the same destination + service into one
+    # rule. Specific mode keeps every source → destination pair on its own row.
     dst_svc_map = defaultdict(list)
     for rule in raw_rules:
-        dst_svc_map[(rule["destination"], rule["service"])].append(rule)
+        key = ((rule["destination"], rule["source"], rule["service"]) if specific
+               else (rule["destination"], rule["service"]))
+        dst_svc_map[key].append(rule)
 
     rules = []
-    for (dst, svc), group in dst_svc_map.items():
-        group.sort(key=lambda r: r["source"])
+    for group in dst_svc_map.values():
+        dst = group[0]["destination"]
+        svc = group[0]["service"]
+        group.sort(key=lambda r: _addr_sort_key(r["source"]))
         sources         = [r["source"]         for r in group]
         sources_display = [r["source_display"]  for r in group]
         rules.append({
@@ -405,7 +447,10 @@ def analyze(rows, subnet_map=None):
             "object_group":        any(r["object_group"] for r in group)
         })
 
-    rules.sort(key=lambda r: (r["destination"], r["source"]))
+    # Sort numerically by destination, then by the rule's lowest source, so
+    # specific mode's long per-host lists read in address order.
+    rules.sort(key=lambda r: (_addr_sort_key(r["destination"]),
+                              _addr_sort_key(r["sources"][0])))
     return rules
 
 
@@ -827,7 +872,7 @@ def recommendations_to_csv(proposed):
 # score floors at 0.
 #
 #   Critical (-6)  'Any' as source, destination, or service — ALLOW rules only
-#   High     (-4)  Overly permissive ALLOW rule: broad network objects
+#   High     (-4)  Overly permissive enabled ALLOW rule: broad network objects
 #                  (/16 or wider), broad service objects (ALL_*, huge port
 #                  ranges), or very long object lists
 #   Medium   (-2)  Bi-directional: Source == Destination
@@ -840,7 +885,7 @@ def recommendations_to_csv(proposed):
 STARTING_SCORE = 1000
 UNUSED_AFTER_DAYS = 180
 BROAD_PREFIX_LEN = 16      # a network object of /16 or wider is "broad"
-MANY_OBJECTS = 10          # more than this many objects in one field is "broad"
+MANY_OBJECTS = 50          # more than this many objects in one field is "broad"
 BROAD_PORT_SPAN = 1000     # a service range covering more ports than this is "broad"
 
 SEVERITY_POINTS = {"Critical": 6, "High": 4, "Medium": 2, "Low": 1}
@@ -963,8 +1008,9 @@ def audit_policy(header, data, today=None):
             if any_fields:
                 flag("any", row, "Any in " + " + ".join(any_fields))
 
-        # High — overly permissive ALLOW rule.
-        if allow:
+        # High — overly permissive ALLOW rule. Disabled rules are skipped: an
+        # inactive rule grants no access, and it is already flagged below.
+        if allow and not disabled:
             reasons = []
             for side, cell in (("Source", src), ("Destination", dst)):
                 objs = _split_objects(cell)
@@ -1422,9 +1468,20 @@ _REPORT_CSS = """
 """
 
 
-def _report_head(title):
+# The engineer report's tables are wide (7 columns of rule data), so it prints
+# landscape on the reader's own paper size and gets a wider on-screen page.
+_LANDSCAPE_CSS = """
+  @page { size: landscape; margin: 12mm; }
+  .page { max-width: 1180px; }
+  table { font-size: 0.76rem; }
+  @media print { .page { max-width: none; } }
+"""
+
+
+def _report_head(title, extra_css=""):
     return ("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            f"<title>{escape(title)}</title><style>{_REPORT_CSS}</style></head><body>"
+            f"<title>{escape(title)}</title><style>{_REPORT_CSS}{extra_css}</style>"
+            "</head><body>"
             "<div class=\"page\">")
 
 
@@ -1514,7 +1571,7 @@ def generate_executive_report(result):
 def generate_engineer_report(result):
     """An engineer-facing HTML runbook: prioritized phases, step-by-step
     remediation guidance, and the flagged rules for each category."""
-    parts = [_report_head("Firewall Policy Cleanup Plan")]
+    parts = [_report_head("Firewall Policy Cleanup Plan", _LANDSCAPE_CSS)]
     parts.append("<header><h1>Firewall Policy Cleanup Plan</h1>"
                  f"<div class=\"meta\">{_report_meta_line(result)}</div></header>")
     parts.append("<h2>Current State</h2>")
@@ -1777,6 +1834,54 @@ ANALYZER_HTML = r"""
     color: var(--success);
     margin-top: 16px;
     min-height: 1.2em;
+  }
+
+  /* ── Output-mode selector ── */
+  .mode-block { margin-top: 22px; }
+  .mode-heading {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .mode-options { display: flex; gap: 12px; flex-wrap: wrap; }
+  .mode-option {
+    position: relative;
+    flex: 1 1 260px;
+    display: block;
+    padding: 14px 18px;
+    border: 1px solid var(--border);
+    background: rgba(255,255,255,0.02);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .mode-option:hover { border-color: var(--accent); }
+  /* The radio is visually hidden but still focusable, so the label carries
+     the focus ring for keyboard users. */
+  .mode-option input[type=radio] { position: absolute; opacity: 0; pointer-events: none; }
+  .mode-option:focus-within { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mode-option.selected {
+    border-color: var(--accent);
+    background: rgba(0,212,255,0.07);
+    box-shadow: 0 0 18px rgba(0,212,255,0.15);
+  }
+  .mode-option .mode-name {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .mode-option.selected .mode-name { color: var(--accent); }
+  .mode-option .mode-desc {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    line-height: 1.6;
+    color: var(--muted);
+    margin-top: 6px;
   }
 
   /* ── Button ── */
@@ -2054,6 +2159,28 @@ ANALYZER_HTML = r"""
     </div>
     <div id="policy-file-name"></div>
 
+    <div class="mode-block">
+      <div class="mode-heading">// output detail</div>
+      <div class="mode-options">
+        <label class="mode-option selected" data-mode="summarize">
+          <input type="radio" name="mode" value="summarize" checked>
+          <div class="mode-name">Consolidated</div>
+          <div class="mode-desc">
+            Summarizes sources into named or /24 subnets, compresses ports into ranges,
+            and merges rules sharing a destination + service. Fewest rules.
+          </div>
+        </label>
+        <label class="mode-option" data-mode="specific">
+          <input type="radio" name="mode" value="specific">
+          <div class="mode-name">Specific</div>
+          <div class="mode-desc">
+            Exact source and destination addresses, every port listed on its own,
+            one rule per source&rarr;destination. Most rules, least assumption.
+          </div>
+        </label>
+      </div>
+    </div>
+
     <div class="actions">
       <button class="btn btn-primary" id="analyze-btn" disabled>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -2168,8 +2295,23 @@ ANALYZER_HTML = r"""
   const coverageStats = document.getElementById('coverage-stats');
   const coverageBody  = document.getElementById('coverage-tbody');
   const downloadCovBtn = document.getElementById('download-coverage-btn');
+  const modeOptions   = Array.from(document.querySelectorAll('.mode-option'));
 
   let lastRules = [];
+
+  // ── Output detail selector ──
+  function syncModeUI() {
+    modeOptions.forEach(o => o.classList.toggle('selected', o.querySelector('input').checked));
+  }
+  modeOptions.forEach(opt => opt.querySelector('input').addEventListener('change', syncModeUI));
+  // Run once on load too: a soft reload restores the radio the user had picked,
+  // which would otherwise leave the highlight on the default option.
+  syncModeUI();
+
+  function selectedMode() {
+    const checked = document.querySelector('.mode-option input:checked');
+    return checked ? checked.value : 'summarize';
+  }
 
   // ── CSV Drag & Drop ──
   dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
@@ -2205,6 +2347,7 @@ ANALYZER_HTML = r"""
   function buildFormData() {
     const fd = new FormData();
     fd.append('file', fileInput.files[0]);
+    fd.append('mode', selectedMode());
     if (policyInput.files.length) fd.append('policy', policyInput.files[0]);
     return fd;
   }
@@ -2224,7 +2367,8 @@ ANALYZER_HTML = r"""
 
       lastRules = data.rules;
       renderResults(data);
-      setStatus('ok', `Done — ${data.rules.length} rule(s) generated from ${data.total_rows} traffic rows.`);
+      const modeLabel = data.mode === 'specific' ? 'specific' : 'consolidated';
+      setStatus('ok', `Done — ${data.rules.length} ${modeLabel} rule(s) generated from ${data.total_rows} traffic rows.`);
     } catch (err) {
       setStatus('error', 'Error: ' + err.message);
     } finally {
@@ -3459,22 +3603,30 @@ def _load_subnet_map():
         return subnet_map
 
 
+def _analysis_mode():
+    """The requested output mode from the form, falling back to full summarization."""
+    mode = (request.form.get("mode") or "").strip().lower()
+    return mode if mode in ANALYSIS_MODES else SUMMARIZE_MODE
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze_route():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     f = request.files["file"]
     try:
+        mode = _analysis_mode()
         subnet_map = _load_subnet_map()
         rows = parse_csv(f)
         total_rows = len(rows)
         filtered = filter_rows(rows)
-        rules = analyze(filtered, subnet_map=subnet_map)
+        rules = analyze(filtered, subnet_map=subnet_map, mode=mode)
         response = {
             "rules": rules,
             "total_rows": total_rows,
             "filtered_rows": len(filtered),
-            "subnet_entries": len(subnet_map)
+            "subnet_entries": len(subnet_map),
+            "mode": mode
         }
         # Optional: cross-reference against an existing policy export so the
         # user can see which flows just need an existing rule amended.
@@ -3496,7 +3648,7 @@ def download_route():
         subnet_map = _load_subnet_map()
         rows = parse_csv(f)
         filtered = filter_rows(rows)
-        rules = analyze(filtered, subnet_map=subnet_map)
+        rules = analyze(filtered, subnet_map=subnet_map, mode=_analysis_mode())
         csv_data = rules_to_csv(rules)
         buf = io.BytesIO(csv_data.encode("utf-8"))
         buf.seek(0)
@@ -3519,7 +3671,7 @@ def download_checkpoint_route():
         subnet_map = _load_subnet_map()
         rows = parse_csv(f)
         filtered = filter_rows(rows)
-        rules = analyze(filtered, subnet_map=subnet_map)
+        rules = analyze(filtered, subnet_map=subnet_map, mode=_analysis_mode())
         script = generate_checkpoint_script(rules, subnet_map=subnet_map)
         buf = io.BytesIO(script.encode("utf-8"))
         buf.seek(0)
@@ -3545,7 +3697,7 @@ def coverage_download_route():
         subnet_map = _load_subnet_map()
         rows = parse_csv(f)
         filtered = filter_rows(rows)
-        rules = analyze(filtered, subnet_map=subnet_map)
+        rules = analyze(filtered, subnet_map=subnet_map, mode=_analysis_mode())
         header, data = parse_policy_csv(policy_file)
         result = match_rules_to_policy(rules, header, data)
         csv_data = coverage_to_csv(rules, result["coverage"])

@@ -52,12 +52,84 @@ PROJECT JOURNAL — Firewall Rule Analyzer
   covered/amend/new and ignores disabled rules; Flask test-client confirms
   /analyze with+without policy and /coverage_download.
 
+2026-08-06  Scanner tuning, landscape engineer report, analyzer output modes
+  Prompt: (1) Policy Scanner - don't flag disabled rules as overly permissive,
+  and raise the "too many objects" threshold to 50. (2) Engineer clean-up plan
+  should print landscape. (3) Rule Analyzer - let the user pick between the
+  current summarize-everything output and a very specific minimal-consolidation
+  output.
+  Outcome (app.py):
+    - audit_policy(): the High "overly permissive" check is now gated on
+      `allow and not disabled` (was `allow`), so a disabled rule only scores
+      the Low "disabled" finding. MANY_OBJECTS 10 -> 50.
+    - Reports: _report_head() takes an optional extra_css; new _LANDSCAPE_CSS
+      (@page size: landscape, wider .page, slightly smaller table font) is
+      applied to generate_engineer_report only. Executive report unchanged.
+    - Analyzer output detail: new SUMMARIZE_MODE/SPECIFIC_MODE/ANALYSIS_MODES
+      constants; analyze(rows, subnet_map, mode) and
+      compress_services(..., compress_ranges=) . SPECIFIC_MODE disables named/
+      /24 summarization on both sides, port-range compression, and the
+      destination+service grouping pass -> one rule per exact src->dst pair
+      with every port listed. Rule dict shape is identical in both modes, so
+      rules_to_csv / generate_checkpoint_script / match_rules_to_policy needed
+      no changes.
+    - Routes: new _analysis_mode() reads an optional `mode` form field
+      (unknown/absent -> summarize) for /analyze, /download,
+      /download_checkpoint, /coverage_download; /analyze echoes `mode` back.
+    - ANALYZER_HTML: "// output detail" radio pair (Consolidated / Specific) in
+      the Input card, .mode-* CSS, selectedMode() + JS .selected class toggle
+      (no :has() dependency), mode appended in buildFormData() so downloads
+      match what's on screen.
+  Verified: sample_traffic.csv gives 4 consolidated vs 23 specific rules;
+  compress_services range toggle unit-checked; synthetic policy rows confirm
+  disabled+broad -> permissive=0/disabled=1, 17 objects -> not flagged,
+  51 objects -> flagged; Flask test-client covers all four analyzer endpoints
+  in both modes plus the invalid-mode fallback; engineer report contains the
+  @page landscape rule and the executive report does not.
+
+2026-08-06  QA pass over the three changes above
+  Prompt: "perform a full QA of your work please".
+  Findings and fixes:
+    - BUG (surfaced by the new Specific mode): rules were sorted lexically, so
+      10.5.9.1, 10.5.9.10, 10.5.9.11, 10.5.9.2 ... Harmless when sources were
+      collapsed, glaring once every host gets its own row. Added
+      _addr_sort_key() (numeric by IP version/address/prefix, non-IP values
+      last) and used it for both the intra-rule source sort and the final rule
+      sort. Proved by re-implementing the ORIGINAL algorithm and diffing:
+      consolidated output is rule-for-rule identical, only ordering changed.
+    - BUG (UI): the .selected highlight was only updated on 'change', so a soft
+      reload that restored the user's radio left the highlight on the default.
+      Extracted syncModeUI() and call it once on load.
+    - Polish: .mode-option got position:relative and a :focus-within outline
+      (the radio is opacity:0, so the label has to carry the focus ring).
+    - DOC DRIFT: README.md still said ">10 objects" for the permissive check.
+      Updated to ">50 objects" + "enabled", documented the new Output Detail
+      choice and the landscape engineer plan, and noted that the subnet name
+      map only applies in Consolidated mode.
+  Verified: 33/33 endpoint regression (all routes x summarize/specific/absent,
+  error paths, category exports, both reports); scanner boundary tests
+  (50 objects clean / 51 flagged on src, dst and service; all Disabled-column
+  truthy spellings; deny + Any + broad-service + wide-range cases; score
+  cross-check); report HTML parsed clean and executive CSS proved byte-equal
+  to _REPORT_CSS; landscape print override proved to win the cascade; embedded
+  JS syntax-checked with node and the selector logic simulated across fresh
+  load / click / restored-reload / nothing-checked; live Werkzeug server smoke
+  test on all three pages.
+  Not verified: no browser automation available, so the mode selector's actual
+  on-screen appearance and the landscape print preview were not eyeballed.
+
 CURRENT STATE
   Done: analyzer handles service/service_id and ICMP echo-request/echo-reply
         (analysis + Check Point script). Result tables in both apps are wider
-        and support drag-to-resize columns. Analyzer can now take an existing
+        and support drag-to-resize columns. Analyzer can take an existing
         policy export and flag each generated rule as already-covered,
-        amend-an-existing-rule, or new.
+        amend-an-existing-rule, or new, and offers a Consolidated vs Specific
+        output-detail choice. Rules now sort numerically by address. Policy
+        Scanner ignores disabled rules for the overly-permissive check and
+        only flags object lists over 50. The engineer clean-up plan prints
+        landscape. README/CLAUDE.md/JOURNAL all current.
   Next: service coverage is textual only (named service objects can't be
-        resolved to ports) — a future service-object dictionary could make
-        "covered vs amend" exact.
+        resolved to ports) - a future service-object dictionary could make
+        "covered vs amend" exact. Consider whether the Critical "Any" check
+        should also skip disabled rules, for consistency with the
+        overly-permissive check (left as-is: not requested).
