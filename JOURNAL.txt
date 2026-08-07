@@ -118,6 +118,138 @@ PROJECT JOURNAL — Firewall Rule Analyzer
   Not verified: no browser automation available, so the mode selector's actual
   on-screen appearance and the landscape print preview were not eyeballed.
 
+2026-08-07  Release snapshot committed (no code changes)
+  Prompt: "update the journal with the recent changes you made".
+  Nothing new was written this session — the two 2026-08-06 work blocks above
+  were already journaled. Recording the one event they don't mention: that
+  work block shipped as commit 0563b76 (app.py, CLAUDE.md, README.md,
+  JOURNAL.txt) and the commit also added fw-tools-v1.zip, a v1 source
+  snapshot of the repo (app.py, spec, samples, docs, .claude/settings, and a
+  stale __pycache__/app.cpython-314.pyc — the .pyc is tracked in git as well
+  and is worth gitignoring at some point).
+  Working tree clean at time of writing.
+
+2026-08-07  Scanner: exempt the Any/Any/Any deny cleanup rule
+  Prompt: the scanner should ignore rules that are source any, destination any,
+  service any and set to deny - that's the cleanup rule and shouldn't count
+  against the score.
+  Outcome (app.py):
+    - New _field_is_any() (cell is ONLY Any/*, unlike _field_has_any which is
+      true for 'Any' mixed with other objects), _is_deny() (explicit
+      deny/drop/reject/block) and _is_cleanup_rule(src, dst, svc, action).
+    - audit_policy(): a matching row hits `continue` before ANY check runs, so
+      it can't be flagged in or deduct points from any of the eight categories.
+      Device/Policy name collection stays above the skip so a cleanup-only
+      export still populates the dashboard. New counters in the result:
+      cleanup_rules (exempt) and audited_rules (total_rules - cleanup_rules);
+      total_rules still counts every row in the file.
+    - Reports: _audited_rules(result) accessor (falls back to total_rules for
+      legacy dicts); _report_meta_line adds "N cleanup rule(s) exempt" and
+      _score_hero's "X of Y rule(s)" percentage now divides by the audited
+      count, not the raw total.
+    - SCANNER_HTML: the done-status line and the score-math line report the
+      audited count plus the exempt count.
+    - Deliberate edge decisions: Any/Any/Any with an ALLOW action is still
+      Critical; a blank/unrecognized Action does NOT qualify as deny (so a
+      malformed row can't slip past the audit); a *disabled* cleanup rule is
+      also fully exempt (skip happens before the disabled check).
+  Verified: 51-check unit suite (all deny/allow/Any spellings and '*', six
+  near-miss rows, disabled cleanup, mixed policy scoring identical to the same
+  policy with the cleanup row deleted, device/policy collection, report render
+  + legacy-dict back-compat); e2e suite on a real SecureTrack export with a
+  cleanup row appended, exercising the header-NAME lookup path rather than the
+  fixed-position fallback (exempt in all 8 categories, absent from
+  scan_download and both reports, two cleanup rules on two devices); 36-check
+  route regression (all analyzer/scanner endpoints x summarize/specific/absent,
+  all 8 category exports, /recommend + /recommend_download JSON routes, error
+  paths) and node --check on the embedded scanner JS. One test-only bug found
+  along the way (the earlier /recommend regression call used multipart; that
+  route takes JSON - the app was right).
+  Not verified: no browser automation, so the new score-math text wasn't
+  eyeballed in a real browser.
+
+2026-08-07  Scanner: waive the Any source on DHCP/BOOTP rules
+  Prompt: if the source is any and the service contains dhcp or bootp, ignore
+  it from scoring.
+  Two readings needed a decision, so I asked:
+    - Scope: waive only the source-side Any/permissive findings (chosen) vs.
+      skip the whole rule like the cleanup rule. Chosen scope keeps the hygiene
+      checks, so a DHCP rule with no logging/comment still surfaces.
+    - Mixed service list: user chose the LITERAL reading - any one service
+      object mentioning dhcp/bootp is enough, so 'Any src + DHCP;tcp-3389' is
+      waived too (I had recommended requiring every service to be DHCP; noted
+      here because it's the one place the waiver can hide real exposure).
+  Outcome (app.py):
+    - _DHCP_SERVICE_RE (r"dhcp|bootp", substring, case-insensitive),
+      _is_dhcp_service(cell) and _dhcp_source_waived(src, svc) =
+      _field_has_any(src) and _is_dhcp_service(svc).
+    - audit_policy(): the row is still audited (no `continue`, unlike the
+      cleanup rule). Critical check removes "Source" from any_fields, so the
+      finding text names only the fields that remain (an Any destination still
+      reads "Any in Destination"). Permissive check `continue`s past the Source
+      side of its src/dst loop; destination and service reasons untouched.
+    - New dhcp_source_waivers counter in the result, shown on the UI score line
+      and in both report meta lines (" · N DHCP Any-source waiver(s)").
+  Verified: 49-check unit suite (9 service spellings waived / 7 not incl. the
+  near-misses 'boot' and 'dh-cp'; a control rule identical but for svc=tcp-3389
+  still scoring 994 proves the waiver is what changed the result; Any-dst and
+  Any-svc still flagged with the finding text naming only those fields; broad
+  destination still High while broad source is waived; all five hygiene checks
+  still firing; interaction with the cleanup exemption, incl. the cleanup rule
+  not being double-counted as a waiver). 21-check e2e on a real SecureTrack
+  export via /scan + both reports + CSV, exercising the header-NAME path.
+  Re-ran the three earlier suites: 181 checks total across five suites, 0 fail.
+  Test-only bug found: I asserted the executive report names the control rule -
+  it's a counts-only leadership summary by design, so the assertion was wrong,
+  not the report. Re-pointed it at the category count and the engineer plan.
+  Not verified: no browser automation, so the lengthened score line (scanned +
+  cleanup + waiver counts) wasn't eyeballed for wrapping in a real browser.
+
+2026-08-07  QA pass over the two scanner exemptions
+  Prompt: "Now please QA your recent work."
+  Approach: re-read the audit loop as it now stands and probed for defects
+  (deny/disabled interactions, degenerate policies, Action-string formats,
+  negation columns, source-side MANY_OBJECTS) rather than only re-running the
+  suites I had already written.
+  Findings and fixes:
+    - BUG (mine, reporting fidelity): dhcp_source_waivers incremented for DENY
+      rules too. Both waived checks are ALLOW-only, so a deny rule has nothing
+      to waive - proved by a control pair scoring identically (1000 vs 1000)
+      while the UI still claimed "1 DHCP Any-source waiver(s)". Fixed by gating
+      the flag itself: dhcp_waived = allow and _dhcp_source_waived(...).
+      Behaviour-preserving for the checks (both are inside `if allow`), so only
+      the reported count changed. Regression added (all four deny spellings
+      report 0; a *disabled ALLOW* DHCP rule still reports 1, because there the
+      Critical check does run and the source Any really is suppressed - 999 vs
+      993 for the control).
+    - Stale comment: the Critical check still explained itself via "an
+      Any-Any-Any drop/cleanup rule is normal practice", reasoning that moved
+      to the skip above it. Rewritten to describe what the block now does,
+      including the Source-only removal for DHCP rules.
+  Confirmed correct (no change needed):
+    - Degenerate inputs: empty policy and cleanup-only policy both give
+      audited=0, score 1000, no divide-by-zero in the report hero ("0 of 0").
+    - Source-side MANY_OBJECTS is waived along with the rest of the source side
+      (Any + 60 objects + DHCP scores clean vs -10 for the non-DHCP control).
+      Correct rather than lax: once the source is Any, the extra objects are
+      moot.
+    - Real exports write Action as 'ALLOW'/'DROP' uppercase - both helpers
+      lower() first, so the sample file's format is handled.
+    - .score-math has no nowrap/fixed width, so the longer score line wraps
+      instead of overflowing (closes the wrapping question left open earlier).
+  Known limitations, deliberately NOT changed (both widen an exemption, so
+  they're the user's call):
+    - _is_deny matches the whole Action cell exactly, so a non-standard
+      spelling like 'Drop (log)' or 'deny all' is not recognised and such a
+      cleanup rule keeps its hygiene findings (-4). A word-boundary/substring
+      match would fix it.
+    - The audit never consults the Source/Destination/Service Negated columns
+      (pre-existing across all eight checks); a negated Any/Any/Any deny rule
+      is still treated as the cleanup rule.
+  Verified: 188 checks across five suites, 0 failures (56 DHCP unit, 51 cleanup
+  unit, 22 + 21 e2e on real SecureTrack exports, 38 route regression incl.
+  node --check on the embedded scanner JS).
+
 CURRENT STATE
   Done: analyzer handles service/service_id and ICMP echo-request/echo-reply
         (analysis + Check Point script). Result tables in both apps are wider
@@ -126,10 +258,23 @@ CURRENT STATE
         amend-an-existing-rule, or new, and offers a Consolidated vs Specific
         output-detail choice. Rules now sort numerically by address. Policy
         Scanner ignores disabled rules for the overly-permissive check and
-        only flags object lists over 50. The engineer clean-up plan prints
-        landscape. README/CLAUDE.md/JOURNAL all current.
+        only flags object lists over 50, exempts the Any/Any/Any deny cleanup
+        rule from the audit entirely, and waives the source-side Any/permissive
+        findings on Any-source DHCP/BOOTP rules. The engineer clean-up plan
+        prints landscape. README/CLAUDE.md/JOURNAL all current. Everything
+        through the 2026-08-06 QA pass is committed (0563b76) and bundled as
+        fw-tools-v1.zip; both scanner exemptions are uncommitted.
   Next: service coverage is textual only (named service objects can't be
         resolved to ports) - a future service-object dictionary could make
         "covered vs amend" exact. Consider whether the Critical "Any" check
         should also skip disabled rules, for consistency with the
-        overly-permissive check (left as-is: not requested).
+        overly-permissive check (left as-is: not requested). Also open: the
+        cleanup exemption requires all three fields to be exactly Any - a
+        cleanup rule written as 'Any / Any / <every service group>' would not
+        be recognized. Watch item: because the DHCP waiver accepts a mixed
+        service list, an Any-source rule permitting DHCP *plus* something risky
+        is no longer flagged for its source - tighten _is_dhcp_service to
+        require every service object if that turns out to hide real exposure.
+        Also open from the QA pass: _is_deny requires an exact Action match
+        ('Drop (log)' is not recognised as a cleanup rule) and the negation
+        columns are still ignored everywhere.

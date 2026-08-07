@@ -145,6 +145,32 @@ floors at 0).
 | Disabled | Low | −1 |
 | Shadowed (`Shadowing Status` is shadowed) | Low | −1 |
 
+### Exemptions
+
+Two kinds of rule only *look* permissive and are not penalized:
+
+**1. The catch-all cleanup rule** — Source `Any`, Destination `Any`, Service
+`Any`, and a deny action (`deny`/`drop`/`reject`/`block`). Every policy is
+expected to end with one, so it is skipped before any check runs, never appears
+in a finding list, and costs no points. A rule that is `Any`/`Any`/`Any` but
+**allows** traffic is still Critical, and a rule with a blank/unrecognized
+Action is never treated as a cleanup rule.
+
+**2. Any-source DHCP/BOOTP rules** — a DHCP client broadcasts before it holds an
+address, so `Any` as the *source* of a DHCP/BOOTP rule is unavoidable rather
+than a defect. When the Source contains `Any` and **any** Service object names
+DHCP or BOOTP (`DHCP`, `dhcp-relay`, `bootps`, `bootpc`, …), the **source side**
+of the Critical `Any` and High overly-permissive checks is waived. Everything
+else about the rule is still audited — an `Any` **destination**, a broad
+destination or service, and every hygiene check (comment, logging, unused,
+shadowed, disabled) all still apply. Unlike the cleanup rule, the row is still
+counted as audited and can still appear in findings. Because both waived checks
+apply to ALLOW rules only, a deny DHCP rule has nothing waived and is not
+reported as a waiver.
+
+The scanner reports how many rules it actually scored, plus the cleanup-exempt
+and DHCP-waiver counts, on the score line and in both HTML reports.
+
 ## Score Dashboard
 
 - **Speedometer gauge** with the score, needle, and color-banded track:

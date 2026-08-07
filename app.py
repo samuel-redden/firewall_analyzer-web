@@ -871,6 +871,13 @@ def recommendations_to_csv(proposed):
 # severity's points (a rule can be flagged by several checks at once); the
 # score floors at 0.
 #
+# Two exemptions, both for rules that only *look* permissive:
+#   * The Any/Any/Any deny cleanup rule (_is_cleanup_rule) is intended
+#     practice, so it is skipped before any check runs and never costs points.
+#   * An Any-source DHCP/BOOTP rule (_dhcp_source_waived) has the source side
+#     of the Critical 'Any' and High permissive checks waived — a client has no
+#     address to be scoped by. Every other check still applies to it.
+#
 #   Critical (-6)  'Any' as source, destination, or service — ALLOW rules only
 #   High     (-4)  Overly permissive enabled ALLOW rule: broad network objects
 #                  (/16 or wider), broad service objects (ALL_*, huge port
@@ -919,15 +926,64 @@ _PORT_RANGE_RE = re.compile(r"(\d{1,5})\s*-\s*(\d{1,5})")
 # 'all' as its own token, where '_'/'-' count as separators: matches ALL_TCP
 # and 'All Services' but not 'Allscripts'.
 _ALL_SERVICE_RE = re.compile(r"(?<![a-z0-9])all(?![a-z0-9])", re.IGNORECASE)
+# DHCP/BOOTP anywhere in a service object name: DHCP, dhcp-relay, bootps, bootpc.
+_DHCP_SERVICE_RE = re.compile(r"dhcp|bootp", re.IGNORECASE)
 
 
 def _is_allow(action):
     return action.strip().lower() in ("allow", "accept", "permit")
 
 
+def _is_deny(action):
+    """
+    True only for an explicit blocking action. A blank/unrecognized Action is
+    deliberately NOT a deny, so a malformed row can't slip past the audit as a
+    cleanup rule.
+    """
+    return action.strip().lower() in ("deny", "drop", "reject", "block")
+
+
 def _field_has_any(cell):
     """True when a Source/Destination/Service cell contains an 'Any' object."""
     return any(o.lower() in ("any", "*") for o in _split_objects(cell))
+
+
+def _field_is_any(cell):
+    """True when a cell is *only* 'Any' (not 'Any' alongside other objects)."""
+    objs = _split_objects(cell)
+    return bool(objs) and all(o.lower() in ("any", "*") for o in objs)
+
+
+def _is_dhcp_service(cell):
+    """True when any object in a Service cell names DHCP or BOOTP."""
+    return any(_DHCP_SERVICE_RE.search(o) for o in _split_objects(cell))
+
+
+def _dhcp_source_waived(src, svc):
+    """
+    True for a DHCP/BOOTP rule with an 'Any' source. A DHCP client has no
+    address until it is leased one, so 'Any' as the *source* of a DHCP/BOOTP
+    rule is unavoidable rather than a defect: the source-side Any and
+    overly-permissive findings are waived. The rest of the audit still applies —
+    an Any *destination*, a broad destination or service, and every hygiene
+    check (comment, logging, unused, shadowed, disabled) are unaffected.
+
+    Callers should only act on this for ALLOW rules; both checks it feeds are
+    ALLOW-only, so a deny rule has nothing to waive.
+    """
+    return _field_has_any(src) and _is_dhcp_service(svc)
+
+
+def _is_cleanup_rule(src, dst, svc, action):
+    """
+    True for the catch-all cleanup rule: Any source, Any destination, Any
+    service, and a deny action. Every policy is expected to end with one, so
+    it is exempt from the audit entirely and never costs points.
+    """
+    return (_is_deny(action)
+            and _field_is_any(src)
+            and _field_is_any(dst)
+            and _field_is_any(svc))
 
 
 def _broad_service_reason(svc_obj):
@@ -976,6 +1032,8 @@ def audit_policy(header, data, today=None):
     devices = []
     policies = []
     rules_with_findings = 0
+    cleanup_rules = 0
+    dhcp_source_waivers = 0
 
     def flag(key, row, detail):
         report = {label: _cell(row, idx) for label, idx in fields}
@@ -987,8 +1045,9 @@ def audit_policy(header, data, today=None):
         src = _cell(row, src_idx)
         dst = _cell(row, dst_idx)
         svc = _cell(row, svc_idx)
+        action = _cell(row, action_idx)
         disabled = _cell(row, disabled_idx).lower() in ("true", "yes", "1", "disabled")
-        allow = _is_allow(_cell(row, action_idx))
+        allow = _is_allow(action)
 
         device = _cell(row, device_idx)
         if device and device not in devices:
@@ -998,13 +1057,33 @@ def audit_policy(header, data, today=None):
         if policy and policy not in policies:
             policies.append(policy)
 
+        # The Any/Any/Any deny rule at the bottom of every policy is the
+        # intended cleanup rule, not a defect. Skip it before any check runs so
+        # it can't be flagged in — or deduct points for — any category.
+        if _is_cleanup_rule(src, dst, svc, action):
+            cleanup_rules += 1
+            continue
+
+        # A DHCP/BOOTP rule can't scope its source — clients broadcast before
+        # they hold an address — so the source side of the two permissiveness
+        # checks is waived. Everything else about the rule is still audited.
+        # Both of those checks are ALLOW-only, so a deny rule has nothing to
+        # waive: gate on `allow` or the reported waiver count overstates itself.
+        dhcp_waived = allow and _dhcp_source_waived(src, svc)
+        if dhcp_waived:
+            dhcp_source_waivers += 1
+
         # Critical — 'Any' as source, destination, or service on an ALLOW rule.
-        # (An Any-Any-Any drop/cleanup rule is normal practice, so deny rules
-        # are exempt.)
+        # Deny rules are exempt (an Any-Any-Any drop is normal practice, and the
+        # cleanup rule was already skipped above). On a DHCP/BOOTP rule only
+        # 'Source' is dropped from the finding, so an Any destination or service
+        # is still reported on its own.
         if allow:
             any_fields = [name for name, cell in
                           (("Source", src), ("Destination", dst), ("Service", svc))
                           if _field_has_any(cell)]
+            if dhcp_waived and "Source" in any_fields:
+                any_fields.remove("Source")
             if any_fields:
                 flag("any", row, "Any in " + " + ".join(any_fields))
 
@@ -1013,6 +1092,8 @@ def audit_policy(header, data, today=None):
         if allow and not disabled:
             reasons = []
             for side, cell in (("Source", src), ("Destination", dst)):
+                if side == "Source" and dhcp_waived:
+                    continue
                 objs = _split_objects(cell)
                 for o in objs:
                     net = _object_network(o)
@@ -1091,6 +1172,9 @@ def audit_policy(header, data, today=None):
         "devices": devices,
         "policies": policies,
         "rules_with_findings": rules_with_findings,
+        "cleanup_rules": cleanup_rules,
+        "audited_rules": len(data) - cleanup_rules,
+        "dhcp_source_waivers": dhcp_source_waivers,
         "columns": AUDIT_REPORT_COLUMNS,
         "categories": categories,
     }
@@ -1485,11 +1569,23 @@ def _report_head(title, extra_css=""):
             "<div class=\"page\">")
 
 
+def _audited_rules(result):
+    """Rules the audit actually scored (total minus exempt cleanup rules)."""
+    return result.get("audited_rules", result["total_rules"])
+
+
 def _report_meta_line(result):
     devices = ", ".join(result["devices"]) or "unknown device"
     date = datetime.now().strftime("%B %d, %Y")
-    return (f"Device(s): <span class=\"device\">{escape(devices)}</span> &middot; "
-            f"Generated {date} &middot; {result['total_rules']} rule(s) reviewed")
+    exempt = result.get("cleanup_rules", 0)
+    dhcp = result.get("dhcp_source_waivers", 0)
+    line = (f"Device(s): <span class=\"device\">{escape(devices)}</span> &middot; "
+            f"Generated {date} &middot; {_audited_rules(result)} rule(s) reviewed")
+    if exempt:
+        line += f" &middot; {exempt} cleanup rule(s) exempt"
+    if dhcp:
+        line += f" &middot; {dhcp} DHCP Any-source waiver(s)"
+    return line
 
 
 def _report_footer():
@@ -1520,8 +1616,9 @@ def _findings_table(result):
 
 def _score_hero(result, extra_desc=""):
     band, color = _report_band(result["score"])
-    pct = (100.0 * result["rules_with_findings"] / result["total_rules"]) if result["total_rules"] else 0.0
-    desc = (f"{result['rules_with_findings']} of {result['total_rules']} rule(s) "
+    audited = _audited_rules(result)
+    pct = (100.0 * result["rules_with_findings"] / audited) if audited else 0.0
+    desc = (f"{result['rules_with_findings']} of {audited} rule(s) "
             f"({pct:.0f}%) have at least one finding; the policy lost "
             f"{result['deductions']} of {result['starting_score']} points.")
     return (f"<div class=\"score-hero\"><div><span class=\"num\" style=\"color:{color}\">"
@@ -3283,7 +3380,8 @@ SCANNER_HTML = r"""
       renderResults(data);
       inputCard.style.display = 'none';
       const findings = data.categories.reduce((sum, c) => sum + c.count, 0);
-      setStatus('ok', `Done — score ${data.score}/${data.starting_score}, ${findings} finding(s) across ${data.total_rules} rule(s).`);
+      const audited = (data.audited_rules != null) ? data.audited_rules : data.total_rules;
+      setStatus('ok', `Done — score ${data.score}/${data.starting_score}, ${findings} finding(s) across ${audited} rule(s).`);
     } catch (err) {
       setStatus('error', 'Error: ' + err.message);
     } finally {
@@ -3362,7 +3460,12 @@ SCANNER_HTML = r"""
       scorePolicies.style.display = 'none';
     }
 
-    scoreMath.textContent = `${data.starting_score} start − ${data.deductions} deducted · ${data.total_rules} rule(s) scanned`;
+    const scanned = (data.audited_rules != null) ? data.audited_rules : data.total_rules;
+    const exempt = data.cleanup_rules || 0;
+    const dhcpWaived = data.dhcp_source_waivers || 0;
+    scoreMath.textContent = `${data.starting_score} start − ${data.deductions} deducted · ${scanned} rule(s) scanned`
+                          + (exempt ? ` · ${exempt} cleanup rule(s) exempt` : '')
+                          + (dhcpWaived ? ` · ${dhcpWaived} DHCP Any-source waiver(s)` : '');
 
     const firstWithFindings = data.categories.find(c => c.count > 0);
     activeCat = (firstWithFindings || data.categories[0]).key;
